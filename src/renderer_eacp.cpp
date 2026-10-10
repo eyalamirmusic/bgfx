@@ -42,6 +42,7 @@ namespace bgfx { namespace eacp
 		enum Enum
 		{
 			CubeRenderTarget,   // G15
+			SamplerKind,
 			SwapChain,          // G16
 			FrameBufferColor,   // attachments eacp's pass refuses together
 			FrameBufferLayer,   // G15
@@ -56,7 +57,6 @@ namespace bgfx { namespace eacp
 			TextureLayers,      // G15
 			TextureSrgb,        // G4
 			UnknownFormat,      // G4
-			CubeMipChain,       // G31
 			TargetMipChain,     // G6
 			ComputeWriteFormat, // G14
 			TextureUpdate,
@@ -71,7 +71,7 @@ namespace bgfx { namespace eacp
 			BlitDepth,          // G36
 			BlitLevel,          // G6, G15
 			BlitWidened,        // G4
-			BlitShadow,         // G32
+			BlitVolume,         // G15
 			Indirect,
 			Msaa,               // window is sample count 1
 			Capture,            // G34
@@ -1093,24 +1093,58 @@ namespace bgfx { namespace eacp
 		return bx::max<uint32_t>(1, _extent >> _mip);
 	}
 
-	/// A bgfx texture: one eacp texture, 2D or cube, plus a CPU copy of every
-	/// level and face for the textures eacp can only replace whole (cubes,
-	/// caller-built mip chains, compressed formats), which updateTexture
-	/// patches and the next submit uploads once.
+	/// The eacp kind a bgfx texture is: bgfx's layers and cube flag, or a
+	/// volume.
+	static GPU::TextureType textureKind(bool _cube, uint16_t _numLayers, bool _volume)
+	{
+		if (_volume)
+		{
+			return GPU::TextureType::ThreeD;
+		}
+
+		if (_cube)
+		{
+			return 1 < _numLayers ? GPU::TextureType::CubeArray : GPU::TextureType::Cube;
+		}
+
+		return 1 < _numLayers ? GPU::TextureType::TwoDArray : GPU::TextureType::TwoD;
+	}
+
+	/// The eacp kind a shader's sampler declares (shaderc's TextureDimension
+	/// id; 1D and unknown are sampled as 2D).
+	static GPU::TextureType samplerKind(uint8_t _dimension)
+	{
+		switch (_dimension)
+		{
+		case 0x03: return GPU::TextureType::TwoDArray; // TextureDimension::Dimension2DArray
+		case 0x04: return GPU::TextureType::Cube;      // TextureDimension::DimensionCube
+		case 0x05: return GPU::TextureType::CubeArray; // TextureDimension::DimensionCubeArray
+		case 0x06: return GPU::TextureType::ThreeD;    // TextureDimension::Dimension3D
+		default:   return GPU::TextureType::TwoD;
+		}
+	}
+
+	/// A bgfx texture: one eacp texture of any kind (2D, cube, 2D array, cube
+	/// array, volume), created from every level of every slice bimg's
+	/// container holds, and updated and read one subresource at a time
+	/// (Texture::updateSubresource, readSubresource). A slice is eacp's: a
+	/// layer, a face, layer*6 + face on a cube array, which is also bimg's
+	/// side index into a container.
 	struct TextureEacp
 	{
 		TextureEacp()
 			: m_flags(0)
 			, m_width(0)
 			, m_height(0)
+			, m_depth(1)
+			, m_numLayers(1)
 			, m_numMips(1)
 			, m_numSides(1)
-			, m_shadowMips(1)
 			, m_requestedFormat(TextureFormat::Unknown)
 			, m_textureFormat(TextureFormat::Unknown)
 			, m_format(GPU::TextureFormat::RGBA8Unorm)
+			, m_kind(GPU::TextureType::TwoD)
 			, m_cube(false)
-			, m_dirty(false)
 			, m_depthFormat(false)
 			, m_stencilFormat(false)
 			, m_depthKept(false)
@@ -1126,6 +1160,11 @@ namespace bgfx { namespace eacp
 			return m_texture
 				&& m_texture->isRenderTarget()
 				;
+		}
+
+		bool isVolume() const
+		{
+			return GPU::TextureType::ThreeD == m_kind;
 		}
 
 		/// Recreates the render target with (or without) a depth plane: eacp's
@@ -1167,20 +1206,9 @@ namespace bgfx { namespace eacp
 			return uint32_t(GPU::levelBytes(m_format, int(mipExtent(m_width, _mip) ), int(mipExtent(m_height, _mip) ) ) );
 		}
 
-		/// Faces in order, each its levels in order: eacp's layout for a cube
-		/// (six faces of one level) and for a chain (one face of N levels).
-		uint32_t imageOffset(uint8_t _side, uint8_t _mip) const
+		uint32_t slices() const
 		{
-			uint32_t faceBytes = 0;
-			uint32_t offset    = 0;
-
-			for (uint8_t mip = 0; mip < m_shadowMips; ++mip)
-			{
-				faceBytes += levelBytes(mip);
-				offset    += mip < _mip ? levelBytes(mip) : 0;
-			}
-
-			return _side*faceBytes + offset;
+			return isVolume() ? 1 : uint32_t(m_numLayers)*m_numSides;
 		}
 
 		void create(const Memory* _mem, uint64_t _flags, uint8_t _skip)
@@ -1196,6 +1224,7 @@ namespace bgfx { namespace eacp
 			}
 
 			const uint8_t startLod = bx::min<uint8_t>(_skip, imageContainer.m_numMips-1);
+			const bool    volume   = bimg::isVolume(imageContainer);
 
 			bimg::TextureInfo ti;
 			bimg::imageGetSize(
@@ -1213,20 +1242,24 @@ namespace bgfx { namespace eacp
 			m_flags           = _flags;
 			m_width           = ti.width;
 			m_height          = ti.height;
+			m_depth           = volume ? bx::max<uint32_t>(1, ti.depth) : 1;
+			m_numLayers       = bx::max<uint16_t>(1, ti.numLayers);
 			m_numMips         = ti.numMips;
 			m_cube            = imageContainer.m_cubeMap;
 			m_numSides        = m_cube ? 6 : 1;
+			m_kind            = textureKind(m_cube, m_numLayers, volume);
 			m_requestedFormat = TextureFormat::Enum(imageContainer.m_format);
 			m_textureFormat   = getViableTextureFormat(imageContainer);
 
 			const bool renderTarget = 0 != (_flags & BGFX_TEXTURE_RT_MASK);
 			const bool computeWrite = 0 != (_flags & BGFX_TEXTURE_COMPUTE_WRITE);
 
-			BX_TRACE("eacp: texture %s (requested %s), %dx%d%s, layers %d, mips %d, RT[%c] CW[%c] sRGB[%c]"
+			BX_TRACE("eacp: texture %s (requested %s), %dx%dx%d%s, layers %d, mips %d, RT[%c] CW[%c] sRGB[%c]"
 				, getName(m_textureFormat)
 				, getName(m_requestedFormat)
 				, ti.width
 				, ti.height
+				, m_depth
 				, m_cube ? "x6" : ""
 				, ti.numLayers
 				, ti.numMips
@@ -1234,13 +1267,6 @@ namespace bgfx { namespace eacp
 				, computeWrite ? 'x' : ' '
 				, 0 != (_flags & BGFX_TEXTURE_SRGB) ? 'x' : ' '
 				);
-
-			if (1 < ti.numLayers
-			||  isVolume(imageContainer) )
-			{
-				traceOnce(Unsupported::TextureLayers, "G15: texture arrays, 3D textures and cube arrays are not created; draws sample the fallback.");
-				return;
-			}
 
 			if (bimg::isDepth(bimg::TextureFormat::Enum(m_textureFormat) ) )
 			{
@@ -1250,10 +1276,21 @@ namespace bgfx { namespace eacp
 				// colour target of this one's own (a depth-only framebuffer).
 				// Sampled through RenderPass::setFragmentDepthTexture on that
 				// target; always a 32-bit float plane, D24S8 and D0S8 with an
-				// 8-bit stencil beside it.
+				// 8-bit stencil beside it. One layer: a depth array has no
+				// colour array to carry it until eacp renders to a layer.
+				if (GPU::TextureType::TwoD != m_kind)
+				{
+					traceOnce(Unsupported::TextureLayers, "G15: a depth texture array or cube is created as one 2D plane (no render to a layer yet).");
+				}
+
 				m_depthFormat   = true;
 				m_stencilFormat = 0 < bimg::getBlockInfo(bimg::TextureFormat::Enum(m_textureFormat) ).stencilBits;
 				m_numMips       = 1;
+				m_numLayers     = 1;
+				m_numSides      = 1;
+				m_depth         = 1;
+				m_cube          = false;
+				m_kind          = GPU::TextureType::TwoD;
 
 				m_desc = GPU::TextureDescriptor();
 				m_desc.width        = int(m_width);
@@ -1275,31 +1312,46 @@ namespace bgfx { namespace eacp
 				traceOnce(Unsupported::TextureSrgb, "G4: BGFX_TEXTURE_SRGB is sampled as linear (no sRGB formats in eacp).");
 			}
 
+			if (GPU::TextureType::CubeArray == m_kind
+			&&  !GPU::Device::shared().supportsCubeArrays() )
+			{
+				traceOnce(Unsupported::TextureLayers, "a cube array on a device without cube arrays (Device::supportsCubeArrays) is not created.");
+				return;
+			}
+
 			// BGFX_TEXTURE_BLIT_DST and BGFX_TEXTURE_READ_BACK ask nothing of eacp:
 			// a blit is Frame::copy, which any texture takes, and every texture
 			// reads back.
 
 			GPU::TextureDescriptor desc;
-			desc.width  = int(m_width);
-			desc.height = int(m_height);
-			desc.format = m_format;
-			desc.cube   = m_cube;
+			desc.width       = int(m_width);
+			desc.height      = int(m_height);
+			desc.format      = m_format;
+			desc.kind        = m_kind;
+			desc.arrayLength = GPU::TextureType::TwoDArray == m_kind || GPU::TextureType::CubeArray == m_kind ? int(m_numLayers) : 1;
+			desc.volumeDepth = int(m_depth);
 
-			// eacp refuses a cube that is rendered into or compute-written (no
-			// way to name the face); such a cube is created as a plain one.
-			desc.renderTarget = renderTarget && !m_cube;
-			desc.computeWrite = computeWrite && !m_cube && GPU::supportsComputeWrite(m_format);
+			// eacp renders into a 2D target only until a pass can name a layer
+			// or face (ColorTarget::slice, G15's second half); a cube or array
+			// render target is created as a plain one, and a framebuffer
+			// refuses it. A kernel writes a 2D texture, an array or a volume
+			// whole; not a cube, which bgfx's kernels declare as a 2D array
+			// (IMAGE2D_ARRAY) while eacp binds the cube's own cube-typed
+			// texture, a mismatch Metal's validation layer stops on (G66-b).
+			const bool cubeKind = GPU::TextureType::Cube == m_kind || GPU::TextureType::CubeArray == m_kind;
+			desc.renderTarget = renderTarget && GPU::TextureType::TwoD == m_kind;
+			desc.computeWrite = computeWrite && GPU::supportsComputeWrite(m_format) && !cubeKind;
 
 			if (computeWrite
 			&&  !desc.computeWrite)
 			{
-				traceOnce(Unsupported::ComputeWriteFormat, "G14/G15: a compute-write texture eacp cannot write (format or cube) is created read-only.");
+				traceOnce(Unsupported::ComputeWriteFormat, "G14/G66-b: a compute-write texture eacp cannot write (format, or a cube as a 2D array) is created read-only.");
 			}
 
 			if (renderTarget
 			&&  !desc.renderTarget)
 			{
-				traceOnce(Unsupported::CubeRenderTarget, "G15: a cube render target is created as a plain cube.");
+				traceOnce(Unsupported::CubeRenderTarget, "G15: a cube, array or volume render target is created as a plain texture (no render to a layer yet).");
 			}
 
 			if (desc.renderTarget)
@@ -1307,116 +1359,122 @@ namespace bgfx { namespace eacp
 				desc.sampleCount = sampleCountFor(_flags);
 			}
 
-			const bool compressed = GPU::isCompressedFormat(m_format);
 			const bool gpuWritten = desc.renderTarget || desc.computeWrite;
 
-			if (gpuWritten)
+			if (gpuWritten
+			&&  1 < m_numMips)
 			{
-				if (1 < m_numMips)
+				// Nothing fills the levels below 0 of a target yet: no autogen
+				// (G6), no pass or kernel at a level (G15's second half).
+				traceOnce(Unsupported::TargetMipChain, "G6: a render target or compute-written texture has one mip level.");
+				m_numMips = 1;
+			}
+
+			// The caller's chain, whatever the kind (a cube's per face).
+			desc.mipLevels = 1 < m_numMips ? int(m_numMips) : 0;
+
+			// Every level of every slice the container holds, in the format eacp
+			// stores: straight out of bgfx's memory where the bytes are eacp's,
+			// decoded or widened into a buffer of its own where not. A texture
+			// made with no data (a target, a dynamic texture) names none.
+			const bool convert = m_textureFormat != m_requestedFormat;
+			const bimg::TextureFormat::Enum wide = widenedFormat(m_textureFormat);
+			const uint32_t numSlices = slices();
+
+			std::vector<GPU::TextureSubresource> subresources;
+			std::vector<std::vector<uint8_t> > storage;
+			std::vector<uint8_t> temp;
+
+			subresources.reserve(numSlices*m_numMips);
+			storage.reserve(convert || bimg::TextureFormat::Count != wide ? numSlices*m_numMips : 0);
+
+			for (uint32_t slice = 0; slice < numSlices; ++slice)
+			{
+				for (uint8_t lod = 0; lod < m_numMips; ++lod)
 				{
-					traceOnce(Unsupported::TargetMipChain, "G6: a render target or compute-written texture has one mip level.");
-				}
+					bimg::ImageMip mip;
 
-				m_numMips    = 1;
-				m_shadowMips = 1;
-			}
-			else if (m_cube
-			     &&  1 < m_numMips)
-			{
-				// eacp takes no caller chain on a cube; it builds one per face
-				// from level 0 (uncompressed only).
-				traceOnce(Unsupported::CubeMipChain, "G31: a cube's own mip chain is replaced by eacp's, built from level 0 (none when compressed).");
-				desc.mipmapped = !compressed;
-				m_shadowMips   = 1;
-			}
-			else
-			{
-				desc.mipLevels = 1 < m_numMips ? int(m_numMips) : 0;
-				m_shadowMips   = m_numMips;
-			}
-
-			std::vector<uint8_t> pixels;
-
-			if (!gpuWritten)
-			{
-				pixels.resize(imageOffset(m_numSides, 0), 0);
-
-				const bool convert = m_textureFormat != m_requestedFormat;
-				const bimg::TextureFormat::Enum wide = widenedFormat(m_textureFormat);
-				std::vector<uint8_t> temp;
-
-				for (uint8_t side = 0; side < m_numSides; ++side)
-				{
-					for (uint8_t lod = 0; lod < m_shadowMips; ++lod)
+					if (!bimg::imageGetRawData(imageContainer, uint16_t(slice), lod+startLod, _mem->data, _mem->size, mip) )
 					{
-						bimg::ImageMip mip;
+						continue;
+					}
 
-						if (!bimg::imageGetRawData(imageContainer, side, lod+startLod, _mem->data, _mem->size, mip) )
+					const uint32_t width  = mipExtent(m_width,  lod);
+					const uint32_t height = mipExtent(m_height, lod);
+					const uint32_t depth  = isVolume() ? mipExtent(m_depth, lod) : 1;
+
+					GPU::TextureSubresource sub;
+					sub.level = int(lod);
+					sub.slice = int(slice);
+
+					if (convert)
+					{
+						// Decoded image by image at bimg's block-aligned size,
+						// then the level's own rows are kept.
+						const uint32_t srcImage = mip.m_size / bx::max<uint32_t>(1, mip.m_depth);
+
+						storage.emplace_back(width*height*depth*4, 0);
+						uint8_t* dst = storage.back().data();
+						temp.resize(mip.m_width*mip.m_height*4);
+
+						for (uint32_t zz = 0; zz < depth && zz < bx::max<uint32_t>(1, mip.m_depth); ++zz)
+						{
+							bimg::imageDecodeToBgra8(g_allocator, temp.data(), mip.m_data + zz*srcImage, mip.m_width, mip.m_height, mip.m_width*4, mip.m_format);
+
+							for (uint32_t yy = 0; yy < height && yy < mip.m_height; ++yy)
+							{
+								bx::memCopy(&dst[(zz*height + yy)*width*4], &temp[yy*mip.m_width*4], bx::min(width, mip.m_width)*4);
+							}
+						}
+
+						sub.pixels = dst;
+					}
+					else if (bimg::TextureFormat::Count != wide)
+					{
+						storage.emplace_back(levelBytes(lod)*depth, 0);
+						bimg::imageConvert(g_allocator, storage.back().data(), wide, mip.m_data, bimg::TextureFormat::Enum(m_textureFormat), width, height, depth);
+						sub.pixels = storage.back().data();
+					}
+					else
+					{
+						if (mip.m_size < levelBytes(lod)*depth)
 						{
 							continue;
 						}
 
-						uint8_t* dst = &pixels[imageOffset(side, lod)];
-
-						if (convert)
-						{
-							// Decoded at bimg's block-aligned size, then the
-							// level's own rows are kept.
-							temp.resize(mip.m_width*mip.m_height*4);
-							bimg::imageDecodeToBgra8(g_allocator, temp.data(), mip.m_data, mip.m_width, mip.m_height, mip.m_width*4, mip.m_format);
-
-							const uint32_t width  = mipExtent(m_width,  lod);
-							const uint32_t height = mipExtent(m_height, lod);
-
-							for (uint32_t yy = 0; yy < height && yy < mip.m_height; ++yy)
-							{
-								bx::memCopy(&dst[yy*width*4], &temp[yy*mip.m_width*4], bx::min(width, mip.m_width)*4);
-							}
-						}
-						else if (bimg::TextureFormat::Count != wide)
-						{
-							bimg::imageConvert(g_allocator, dst, wide, mip.m_data, bimg::TextureFormat::Enum(m_textureFormat)
-								, mipExtent(m_width, lod), mipExtent(m_height, lod), 1);
-						}
-						else
-						{
-							bx::memCopy(dst, mip.m_data, bx::min(mip.m_size, levelBytes(lod) ) );
-						}
+						sub.pixels = mip.m_data;
 					}
+
+					subresources.push_back(sub);
 				}
 			}
 
 			m_desc = desc;
-			m_texture.emplace(GPU::Device::shared().makeTexture(desc, pixels.empty() ? NULL : pixels.data() ) );
+			m_texture.emplace(GPU::Device::shared().makeTextureFromSubresources(desc, subresources) );
 
 			if (!m_texture->isValid() )
 			{
-				BX_TRACE("eacp: makeTexture refused %dx%d %s.", m_width, m_height, getName(m_textureFormat) );
+				BX_TRACE("eacp: makeTextureFromSubresources refused %dx%dx%d %s, %d layers%s, %d mips."
+					, m_width, m_height, m_depth, getName(m_textureFormat), m_numLayers, m_cube ? " x6" : "", m_numMips);
 				m_texture.reset();
 				return;
 			}
 
 			m_numMips = uint8_t(m_texture->mipLevels() );
-
-			if (!gpuWritten
-			&& (m_cube || 1 < m_shadowMips || compressed) )
-			{
-				m_shadow = std::move(pixels);
-			}
 		}
 
 		void destroy()
 		{
 			m_texture.reset();
-			m_shadow.clear();
-			m_shadow.shrink_to_fit();
-			m_dirty         = false;
 			m_depthFormat   = false;
 			m_stencilFormat = false;
 			m_depthKept     = false;
 			m_depthOf       = kInvalidHandle;
 		}
 
+		/// One box of one level of one slice, through updateSubresource: bgfx's
+		/// _z is the layer of an array or cube array (_side the face), or the
+		/// first image of a volume, _depth the images.
 		void update(uint8_t _side, uint8_t _mip, const Rect& _rect, uint16_t _z, uint16_t _depth, uint16_t _pitch, const Memory* _mem)
 		{
 			if (!m_texture)
@@ -1424,22 +1482,33 @@ namespace bgfx { namespace eacp
 				return;
 			}
 
-			if (0 != _z
-			||  1 < _depth)
-			{
-				traceOnce(Unsupported::TextureLayers, "G15: an update of a texture layer or 3D slice is skipped.");
-				return;
-			}
-
 			const uint32_t mipWidth  = mipExtent(m_width,  _mip);
 			const uint32_t mipHeight = mipExtent(m_height, _mip);
+			const uint32_t mipDepth  = isVolume() ? mipExtent(m_depth, _mip) : 1;
+			const uint32_t depth     = isVolume() ? bx::max<uint32_t>(1, _depth) : 1;
+			const uint32_t z         = isVolume() ? _z : 0;
+			const uint32_t slice     = isVolume() ? 0 : uint32_t(_z)*m_numSides + _side;
 
-			if (_side >= m_numSides
-			||  _rect.m_x + _rect.m_width  > mipWidth
-			||  _rect.m_y + _rect.m_height > mipHeight
+			// A level of a block format smaller than a block is updated with a
+			// whole block, which bgfx names as a block-sized rect (stored or
+			// decoded); the region eacp takes ends at the level's edge.
+			const bimg::ImageBlockInfo& requestedBlock = bimg::getBlockInfo(bimg::TextureFormat::Enum(m_requestedFormat) );
+			const bool     blocks    = GPU::isCompressedFormat(m_format);
+			const uint32_t boundW    = bx::strideAlign(mipWidth,  requestedBlock.blockWidth);
+			const uint32_t boundH    = bx::strideAlign(mipHeight, requestedBlock.blockHeight);
+
+			if (_mip >= m_numMips
+			||  _side >= m_numSides
+			||  slice >= slices()
+			||  z + depth > mipDepth
+			||  _rect.m_x + _rect.m_width  > boundW
+			||  _rect.m_y + _rect.m_height > boundH
+			||  _rect.m_x >= mipWidth
+			||  _rect.m_y >= mipHeight
 			||  0 == _rect.m_width
 			||  0 == _rect.m_height)
 			{
+				traceOnce(Unsupported::TextureUpdate, "an update outside the texture's levels, slices or extent is skipped.");
 				return;
 			}
 
@@ -1456,8 +1525,9 @@ namespace bgfx { namespace eacp
 				? (_rect.m_height + blockInfo.blockHeight - 1)/blockInfo.blockHeight
 				: _rect.m_height
 				;
+			const uint32_t srcImage = srcPitch*rows;
 
-			if (srcPitch*(rows-1) + tightPitch > _mem->size)
+			if ( (depth-1)*srcImage + srcPitch*(rows-1) + tightPitch > _mem->size)
 			{
 				return;
 			}
@@ -1466,158 +1536,114 @@ namespace bgfx { namespace eacp
 			uint32_t       pitch = srcPitch;
 			std::vector<uint8_t> temp;
 
-			if (m_textureFormat != m_requestedFormat)
+			if (m_textureFormat != m_requestedFormat
+			||  bimg::TextureFormat::Count != widenedFormat(m_textureFormat) )
 			{
-				// bimg decodes from tight rows.
-				std::vector<uint8_t> tight(tightPitch*rows);
-				for (uint32_t yy = 0; yy < rows; ++yy)
+				// bimg decodes and converts from tight rows.
+				std::vector<uint8_t> tight(tightPitch*rows*depth);
+				for (uint32_t zz = 0; zz < depth; ++zz)
 				{
-					bx::memCopy(&tight[yy*tightPitch], &data[yy*srcPitch], tightPitch);
+					for (uint32_t yy = 0; yy < rows; ++yy)
+					{
+						bx::memCopy(&tight[(zz*rows + yy)*tightPitch], &data[zz*srcImage + yy*srcPitch], tightPitch);
+					}
 				}
 
-				temp.resize(_rect.m_width*_rect.m_height*4);
-				bimg::imageDecodeToBgra8(g_allocator, temp.data(), tight.data(), _rect.m_width, _rect.m_height, _rect.m_width*4, requested);
-				data  = temp.data();
-				pitch = _rect.m_width*4;
-			}
-			else if (bimg::TextureFormat::Count != widenedFormat(m_textureFormat) )
-			{
-				// Into the wider format the texture is stored as.
-				std::vector<uint8_t> tight(tightPitch*rows);
-				for (uint32_t yy = 0; yy < rows; ++yy)
+				const uint32_t imageBytes = tightPitch*rows;
+
+				if (m_textureFormat != m_requestedFormat)
 				{
-					bx::memCopy(&tight[yy*tightPitch], &data[yy*srcPitch], tightPitch);
+					pitch = _rect.m_width*4;
+					temp.resize(pitch*_rect.m_height*depth);
+
+					for (uint32_t zz = 0; zz < depth; ++zz)
+					{
+						bimg::imageDecodeToBgra8(g_allocator, &temp[zz*pitch*_rect.m_height], &tight[zz*imageBytes], _rect.m_width, _rect.m_height, pitch, requested);
+					}
+				}
+				else
+				{
+					// Into the wider format the texture is stored as.
+					pitch = _rect.m_width*uint32_t(GPU::bytesPerPixel(m_format) );
+					temp.resize(pitch*_rect.m_height*depth);
+					bimg::imageConvert(g_allocator, temp.data(), widenedFormat(m_textureFormat), tight.data(), requested, _rect.m_width, _rect.m_height, depth);
 				}
 
-				pitch = _rect.m_width*uint32_t(GPU::bytesPerPixel(m_format) );
-				temp.resize(pitch*_rect.m_height);
-				bimg::imageConvert(g_allocator, temp.data(), widenedFormat(m_textureFormat), tight.data(), requested, _rect.m_width, _rect.m_height, 1);
 				data = temp.data();
 			}
 
-			if (m_shadow.empty() )
-			{
-				if (0 != _mip)
-				{
-					traceOnce(Unsupported::TextureUpdate, "an update of a mip level eacp built itself is skipped.");
-					return;
-				}
+			const uint32_t storedRows = blocks ? rows : _rect.m_height;
 
-				m_texture->update(
-					  ::eacp::Graphics::Rect(float(_rect.m_x), float(_rect.m_y), float(_rect.m_width), float(_rect.m_height) )
-					, data
-					, int(pitch)
-					);
+			GPU::TextureRegion region;
+			region.level         = int(_mip);
+			region.slice         = int(slice);
+			region.origin        = { int(_rect.m_x), int(_rect.m_y), int(z) };
+			region.size          = { int(bx::min<uint32_t>(_rect.m_width, mipWidth - _rect.m_x) ), int(bx::min<uint32_t>(_rect.m_height, mipHeight - _rect.m_y) ), int(depth) };
+			region.bytesPerRow   = int(pitch);
+			region.bytesPerImage = int(pitch*storedRows);
+
+			m_texture->updateSubresource(region, data);
+		}
+
+		/// One level of one slice as bgfx lays it out (the first image of a
+		/// volume's level, as renderer_mtl.cpp reads): a widened format is read
+		/// wide and converted back.
+		void read(void* _data, uint16_t _layer, uint8_t _mip)
+		{
+			if (!m_texture)
+			{
 				return;
 			}
 
-			if (_mip >= m_shadowMips)
+			if (_mip >= m_numMips
+			||  _layer >= slices() )
 			{
-				traceOnce(Unsupported::TextureUpdate, "an update of a mip level eacp built itself is skipped.");
+				traceOnce(Unsupported::TextureRead, "readTexture of a level or layer the texture does not have is not read.");
 				return;
 			}
 
-			// Into the CPU copy, uploaded whole at the next submit.
-			const bool blocks = GPU::isCompressedFormat(m_format);
-			const uint32_t levelPitch = uint32_t(GPU::levelBytesPerRow(m_format, int(mipWidth) ) );
-			const uint32_t dstX       = blocks ? _rect.m_x/4 * uint32_t(GPU::bytesPerBlock(m_format) ) : _rect.m_x*uint32_t(GPU::bytesPerPixel(m_format) );
-			const uint32_t dstY       = blocks ? _rect.m_y/4 : _rect.m_y;
-			const uint32_t rowBytes   = blocks ? tightPitch  : _rect.m_width*uint32_t(GPU::bytesPerPixel(m_format) );
-			const uint32_t numRows    = blocks ? rows        : _rect.m_height;
-
-			uint8_t* dst = &m_shadow[imageOffset(_side, _mip)];
-
-			for (uint32_t yy = 0; yy < numRows; ++yy)
+			if (GPU::isCompressedFormat(m_format) )
 			{
-				bx::memCopy(&dst[(dstY+yy)*levelPitch + dstX], &data[yy*pitch], bx::min(rowBytes, levelPitch - dstX) );
+				traceOnce(Unsupported::TextureRead, "readTexture of a block-compressed texture is not read (eacp's readSubresource refuses blocks).");
+				return;
 			}
 
-			m_dirty = true;
-		}
+			const uint32_t width  = mipExtent(m_width,  _mip);
+			const uint32_t height = mipExtent(m_height, _mip);
 
-		/// The CPU copy to the GPU, when an update changed it.
-		void flush()
-		{
-			if (m_dirty
-			&&  m_texture)
-			{
-				m_texture->update(m_shadow.data() );
-			}
+			GPU::TextureRegion region;
+			region.level  = int(_mip);
+			region.slice  = int(_layer);
+			region.origin = { 0, 0, 0 };
+			region.size   = { int(width), int(height), 1 };
 
-			m_dirty = false;
-		}
-
-		/// One level as bgfx lays it out: a widened format is read wide and
-		/// converted back.
-		void read(void* _data, uint8_t _mip)
-		{
 			const bimg::TextureFormat::Enum wide = widenedFormat(m_textureFormat);
 
 			if (bimg::TextureFormat::Count == wide)
 			{
-				readStored(_data, _mip);
+				m_texture->readSubresource(region, _data);
 				return;
 			}
 
 			std::vector<uint8_t> temp(levelBytes(_mip), 0);
-
-			if (readStored(temp.data(), _mip) )
-			{
-				bimg::imageConvert(g_allocator, _data, bimg::TextureFormat::Enum(m_textureFormat), temp.data(), wide
-					, mipExtent(m_width, _mip), mipExtent(m_height, _mip), 1);
-			}
-		}
-
-		/// One level in the format eacp stores it as; false when nothing was
-		/// read.
-		bool readStored(void* _data, uint8_t _mip)
-		{
-			if (!m_texture)
-			{
-				return false;
-			}
-
-			flush();
-
-			if (!m_shadow.empty()
-			&& (0 != _mip || m_cube || GPU::isCompressedFormat(m_format) ) )
-			{
-				// What eacp cannot read back (a level below 0, a cube, blocks) is
-				// what was last uploaded, which only the CPU wrote.
-				if (_mip < m_shadowMips)
-				{
-					bx::memCopy(_data, &m_shadow[imageOffset(0, _mip)], levelBytes(_mip) );
-					return true;
-				}
-
-				return false;
-			}
-
-			if (0 != _mip
-			||  m_cube)
-			{
-				traceOnce(Unsupported::TextureRead, "readTexture of a level below 0 or of a cube face is not read.");
-				return false;
-			}
-
-			m_texture->read(_data);
-			return true;
+			m_texture->readSubresource(region, temp.data() );
+			bimg::imageConvert(g_allocator, _data, bimg::TextureFormat::Enum(m_textureFormat), temp.data(), wide, width, height, 1);
 		}
 
 		std::optional<GPU::Texture> m_texture;
-		std::vector<uint8_t> m_shadow;
 		uint64_t m_flags;
 		uint32_t m_width;
 		uint32_t m_height;
+		uint32_t m_depth;     // a volume's images, 1 otherwise
+		uint16_t m_numLayers; // an array's layers (cubes on a cube array), 1 otherwise
 		uint8_t  m_numMips;
 		uint8_t  m_numSides;
-		uint8_t  m_shadowMips;
 		TextureFormat::Enum m_requestedFormat;
 		TextureFormat::Enum m_textureFormat;
 		GPU::TextureFormat  m_format;
+		GPU::TextureType    m_kind;
 		GPU::TextureDescriptor m_desc;
 		bool m_cube;
-		bool m_dirty;
 		bool m_depthFormat;   // a bgfx depth (or stencil) format, no eacp texture of its own
 		bool m_stencilFormat; // ... with a stencil plane
 		bool m_depthKept;     // the depth plane holds what a pass kept (DepthAction::Resume may load it)
@@ -1803,6 +1829,10 @@ namespace bgfx { namespace eacp
 				| BGFX_CAPS_BLEND_INDEPENDENT
 				| BGFX_CAPS_DRAW_INDIRECT
 				| (device.supportsIndirectCount() ? BGFX_CAPS_DRAW_INDIRECT_COUNT : 0)
+				// 2D arrays are maxTextureLayers above 1 and volumes
+				// BGFX_CAPS_FORMAT_TEXTURE_3D (fillFormatCaps); bgfx has no
+				// caps bit for either.
+				| (device.supportsCubeArrays() ? BGFX_CAPS_TEXTURE_CUBE_ARRAY : 0)
 				;
 
 			fillFormatCaps(device);
@@ -1813,7 +1843,11 @@ namespace bgfx { namespace eacp
 			// eacp reports no limit; 16384 is what every Metal GPU since the
 			// A8/Mac2 family takes, and D3D12 feature level 11's floor.
 			g_caps.limits.maxTextureSize      = 16384;
-			g_caps.limits.maxTextureLayers    = 1;
+			// Layers of a 2D array (Device::maxTextureLayers, 2048 on all three
+			// backends); a cube array's limit is cubes times six within it,
+			// which bgfx has no limit of its own for. bgfx has no 3D size limit
+			// either: eacp refuses a volume past maxTextureSize3D (2048).
+			g_caps.limits.maxTextureLayers    = uint32_t(bx::max(device.maxTextureLayers(), 1) );
 			g_caps.limits.maxFBAttachments    = bx::min<uint32_t>(GPU::maxColorAttachments, BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS);
 			// A stage's texture slots, each with its per-bind sampler: 16 on
 			// Metal and Vulkan, 8 on D3D12 (Device::maxTextureSlots).
@@ -1852,8 +1886,9 @@ namespace bgfx { namespace eacp
 				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER_MSAA
 				;
 
-			// What toEacpFormat maps: 2D and cube (eacp's two dimensionalities),
-			// renderable where eacp renders to it. No _SRGB (G4), no 3D (G15),
+			// What toEacpFormat maps: 2D, cube and (uncompressed) 3D, each also
+			// as an array where bgfx asks for layers (maxTextureLayers,
+			// BGFX_CAPS_TEXTURE_CUBE_ARRAY), renderable where eacp renders to it. No _SRGB (G4),
 			// _VERTEX where the device samples in the vertex stage (G17), no
 			// _MIP_AUTOGEN (G6), _IMAGE_* only where eacp
 			// makes a compute-write texture (G14). _MSAA and _FRAMEBUFFER_MSAA
@@ -1866,8 +1901,12 @@ namespace bgfx { namespace eacp
 			const uint32_t sampled = 0
 				| BGFX_CAPS_FORMAT_TEXTURE_2D
 				| BGFX_CAPS_FORMAT_TEXTURE_CUBE
+				| BGFX_CAPS_FORMAT_TEXTURE_3D
 				| vertex
 				;
+
+			// eacp refuses a compressed volume.
+			const uint32_t blocks = sampled & ~BGFX_CAPS_FORMAT_TEXTURE_3D;
 
 			g_caps.formats[TextureFormat::BGRA8  ] = renderable | sampled | BGFX_CAPS_FORMAT_TEXTURE_BACKBUFFER;
 			g_caps.formats[TextureFormat::RGBA8  ] = renderable | sampled;
@@ -1925,15 +1964,16 @@ namespace bgfx { namespace eacp
 
 			if (_device.supportsBlockCompression() )
 			{
-				g_caps.formats[TextureFormat::BC1] = sampled;
-				g_caps.formats[TextureFormat::BC2] = sampled;
-				g_caps.formats[TextureFormat::BC3] = sampled;
-				g_caps.formats[TextureFormat::BC7] = sampled;
+				g_caps.formats[TextureFormat::BC1] = blocks;
+				g_caps.formats[TextureFormat::BC2] = blocks;
+				g_caps.formats[TextureFormat::BC3] = blocks;
+				g_caps.formats[TextureFormat::BC7] = blocks;
 			}
 		}
 
 		/// What a sampler slot reads when the draw binds nothing there, or a
-		/// texture eacp could not create: opaque white, 2D and cube.
+		/// texture eacp could not create (or of another kind than the shader
+		/// declares): opaque white, one per TextureType, 1x1 (x1).
 		void createFallbackTextures()
 		{
 			const uint8_t white[6*4] =
@@ -1942,19 +1982,28 @@ namespace bgfx { namespace eacp
 				0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,
 			};
 
-			for (uint32_t ii = 0; ii < 2; ++ii)
+			for (uint32_t ii = 0; ii < BX_COUNTOF(m_fallback); ++ii)
 			{
 				TextureEacp& fallback = m_fallback[ii];
+				const GPU::TextureType kind = GPU::TextureType(ii);
+				const bool cube = GPU::TextureType::Cube == kind || GPU::TextureType::CubeArray == kind;
+
+				if (GPU::TextureType::CubeArray == kind
+				&&  !GPU::Device::shared().supportsCubeArrays() )
+				{
+					continue;
+				}
 
 				GPU::TextureDescriptor desc;
 				desc.width  = 1;
 				desc.height = 1;
 				desc.format = GPU::TextureFormat::RGBA8Unorm;
-				desc.cube   = 1 == ii;
+				desc.kind   = kind;
 
 				fallback.m_texture.emplace(GPU::Device::shared().makeTexture(desc, white) );
-				fallback.m_cube            = desc.cube;
-				fallback.m_numSides        = desc.cube ? 6 : 1;
+				fallback.m_kind            = kind;
+				fallback.m_cube            = cube;
+				fallback.m_numSides        = cube ? 6 : 1;
 				fallback.m_width           = 1;
 				fallback.m_height          = 1;
 				fallback.m_flags           = BGFX_SAMPLER_POINT;
@@ -2151,12 +2200,6 @@ namespace bgfx { namespace eacp
 		/// it already is.
 		void readTexture(TextureHandle _handle, void* _data, uint16_t _layer, uint8_t _mip) override
 		{
-			if (0 != _layer)
-			{
-				traceOnce(Unsupported::TextureLayers, "G15: readTexture of a layer other than 0 is not read.");
-				return;
-			}
-
 			TextureEacp& texture = m_textures[_handle.idx];
 
 			if (texture.m_depthFormat)
@@ -2173,7 +2216,7 @@ namespace bgfx { namespace eacp
 				flushFrame();
 			}
 
-			texture.read(_data, _mip);
+			texture.read(_data, _layer, _mip);
 		}
 
 		/// Buffer::read of a compute or indirect buffer (bgfx refuses the rest),
@@ -2406,7 +2449,7 @@ namespace bgfx { namespace eacp
 		void readBack(TextureEacp& _texture, void* _data)
 		{
 			flushFrame();
-			_texture.read(_data, 0);
+			_texture.read(_data, 0, 0);
 		}
 
 		/// Commits what this frame has recorded so far, so a read sees it.
@@ -2757,7 +2800,7 @@ namespace bgfx { namespace eacp
 					continue;
 				}
 
-				const bool cube = 0x04 == slot.m_dimension; // TextureDimension::DimensionCube
+				const GPU::TextureType kind = samplerKind(slot.m_dimension);
 				const Binding& bind = _renderBind.m_bind[slot.m_stage];
 
 				const TextureEacp* texture = NULL;
@@ -2801,17 +2844,29 @@ namespace bgfx { namespace eacp
 						continue;
 					}
 					else if (!texture->m_texture
-					     ||  texture->m_cube != cube
 					     ||  isPassAttachment(bind.m_idx) )
 					{
+						texture = NULL;
+					}
+					else if (texture->m_kind != kind)
+					{
+						// Metal samples nothing through a texture of another
+						// type than the shader declared, and reports it only
+						// under the validation layer.
+						traceOnce(Unsupported::SamplerKind, "a texture of another kind than the shader samples (2D, cube, array, volume) reads the white fallback.");
 						texture = NULL;
 					}
 				}
 
 				if (NULL == texture)
 				{
-					texture = &m_fallback[cube ? 1 : 0];
+					texture = &m_fallback[uint32_t(kind)];
 					flags   = uint32_t(texture->m_flags);
+				}
+
+				if (!texture->m_texture)
+				{
+					continue;
 				}
 
 				const GPU::Sampler& sampler = getSampler(flags, lodMin, lodMax);
@@ -3587,13 +3642,6 @@ namespace bgfx { namespace eacp
 			m_colorPalette = _render->m_colorPalette;
 			m_reset        = _render->m_reset;
 
-			// This frame's updateTexture calls into the textures eacp replaces
-			// whole, one upload each.
-			for (uint32_t ii = 0; ii < BX_COUNTOF(m_textures); ++ii)
-			{
-				m_textures[ii].flush();
-			}
-
 			if (0 < _render->m_iboffset)
 			{
 				TransientIndexBuffer* ib = _render->m_transientIb;
@@ -3904,8 +3952,9 @@ namespace bgfx { namespace eacp
 		/// textures of a blit have one format, which is what a copy asks, so
 		/// every blit eacp can name is a copy and nothing is drawn: what is
 		/// left out is what eacp cannot hold (a depth texture, G36; a level a
-		/// render target was not given, G6; a layer or slice, G15) and a buffer
-		/// copy of a widened format, whose bytes differ (G4).
+		/// render target was not given, G6; more than one image of a volume,
+		/// G15) and a buffer copy of a widened format, whose bytes differ (G4).
+		/// A blit of several layers is a copy per layer.
 		void submitBlit(GPU::Frame& _frame, const BlitItem& _blit)
 		{
 			endPass();
@@ -3933,11 +3982,18 @@ namespace bgfx { namespace eacp
 				BufferEacp*  buffer  = bufferOf(toBuffer ? _blit.m_dst : _blit.m_src);
 				TextureEacp& texture = m_textures[toBuffer ? _blit.m_src.idx : _blit.m_dst.idx];
 
+				const uint16_t z = toBuffer ? _blit.m_srcZ : _blit.m_dstZ;
+
 				if (NULL == buffer
 				||  !buffer->m_static
-				||  !blitTexture(texture, toBuffer ? _blit.m_srcMip : _blit.m_dstMip, toBuffer ? _blit.m_srcZ : _blit.m_dstZ, _blit.m_depth) )
+				||  !blitTexture(texture, toBuffer ? _blit.m_srcMip : _blit.m_dstMip, z, 1) )
 				{
 					return;
+				}
+
+				if (1 < _blit.m_depth)
+				{
+					traceOnce(Unsupported::BlitLevel, "G15: a blit between a buffer and more than one layer or image of a texture copies the first.");
 				}
 
 				if (bimg::TextureFormat::Count != widenedFormat(texture.m_textureFormat) )
@@ -3950,8 +4006,8 @@ namespace bgfx { namespace eacp
 				layout.bufferOffset = toBuffer ? _blit.m_dstOffset : _blit.m_srcOffset;
 				layout.bytesPerRow  = int(_blit.m_rowPitch);
 				layout.level        = toBuffer ? _blit.m_srcMip : _blit.m_dstMip;
-				layout.slice        = texture.m_cube ? (toBuffer ? _blit.m_srcZ : _blit.m_dstZ) : 0;
-				layout.origin       = { int(toBuffer ? _blit.m_srcX : _blit.m_dstX), int(toBuffer ? _blit.m_srcY : _blit.m_dstY), 0 };
+				layout.slice        = texture.isVolume() ? 0 : int(z);
+				layout.origin       = { int(toBuffer ? _blit.m_srcX : _blit.m_dstX), int(toBuffer ? _blit.m_srcY : _blit.m_dstY), texture.isVolume() ? int(z) : 0 };
 				layout.size         = { int(_blit.m_width), int(_blit.m_height), 1 };
 
 				if (toBuffer)
@@ -3975,26 +4031,39 @@ namespace bgfx { namespace eacp
 				return;
 			}
 
-			GPU::TextureCopyRegion region;
-			region.sourceLevel       = _blit.m_srcMip;
-			region.sourceSlice       = src.m_cube ? _blit.m_srcZ : 0;
-			region.sourceOrigin      = { int(_blit.m_srcX), int(_blit.m_srcY), 0 };
-			region.destinationLevel  = _blit.m_dstMip;
-			region.destinationSlice  = dst.m_cube ? _blit.m_dstZ : 0;
-			region.destinationOrigin = { int(_blit.m_dstX), int(_blit.m_dstY), 0 };
-			region.size              = { int(_blit.m_width), int(_blit.m_height), 1 };
+			// A volume's images are z at slice 0 (one image a copy, G15),
+			// anything else's layers and faces are slices, one copy each.
+			for (uint16_t ii = 0; ii < bx::max<uint16_t>(1, _blit.m_depth); ++ii)
+			{
+				const uint16_t srcZ = _blit.m_srcZ + ii;
+				const uint16_t dstZ = _blit.m_dstZ + ii;
 
-			_frame.copy(*src.m_texture, *dst.m_texture, region);
+				GPU::TextureCopyRegion region;
+				region.sourceLevel       = _blit.m_srcMip;
+				region.sourceSlice       = src.isVolume() ? 0 : srcZ;
+				region.sourceOrigin      = { int(_blit.m_srcX), int(_blit.m_srcY), src.isVolume() ? int(srcZ) : 0 };
+				region.destinationLevel  = _blit.m_dstMip;
+				region.destinationSlice  = dst.isVolume() ? 0 : dstZ;
+				region.destinationOrigin = { int(_blit.m_dstX), int(_blit.m_dstY), dst.isVolume() ? int(dstZ) : 0 };
+				region.size              = { int(_blit.m_width), int(_blit.m_height), 1 };
+
+				_frame.copy(*src.m_texture, *dst.m_texture, region);
+			}
 		}
 
 		/// Whether one side of a blit is a texture level eacp has: a colour
 		/// texture (depth has no texture of its own, G36), a level it was made
-		/// with (render targets have one, G6), and a cube face or slice 0 (no
-		/// arrays or 3D textures, G15). A texture with a CPU copy (a cube, a
-		/// caller-built chain, blocks) is re-uploaded whole from that copy by its
-		/// next update, which would undo a copy into it (G32).
+		/// with (render targets have one, G6), and slices it has; a volume only
+		/// its first image (eacp's copies take no z yet, G15's second half).
 		bool blitTexture(const TextureEacp& _texture, uint8_t _mip, uint16_t _z, uint16_t _depth)
 		{
+			if (_texture.isVolume()
+			&& (0 != _z || 1 < _depth) )
+			{
+				traceOnce(Unsupported::BlitVolume, "G15: a blit of a 3D texture's images past the first is skipped (eacp copies take no z yet).");
+				return false;
+			}
+
 			if (_texture.m_depthFormat)
 			{
 				traceOnce(Unsupported::BlitDepth, "G36: a blit to or from a depth texture is skipped (no eacp depth texture to copy).");
@@ -4006,17 +4075,16 @@ namespace bgfx { namespace eacp
 				return false;
 			}
 
-			if (_mip >= _texture.m_texture->mipLevels()
-			||  1 < _depth
-			|| (!_texture.m_cube && 0 != _z) )
-			{
-				traceOnce(Unsupported::BlitLevel, "G6/G15: a blit of a level the texture was not made with (render targets have one), a layer or a 3D slice is skipped.");
-				return false;
-			}
+			const uint32_t extent = _texture.isVolume()
+				? mipExtent(_texture.m_depth, _mip)
+				: _texture.slices()
+				;
 
-			if (!_texture.m_shadow.empty() )
+			if (_mip >= _texture.m_texture->mipLevels()
+			||  uint32_t(_z) + bx::max<uint16_t>(1, _depth) > extent)
 			{
-				traceOnce(Unsupported::BlitShadow, "G32: a blit into a texture eacp replaces whole (cube, mip chain, blocks) is undone by that texture's next updateTexture.");
+				traceOnce(Unsupported::BlitLevel, "G6: a blit of a level, layer or image the texture was not made with (render targets have one level) is skipped.");
+				return false;
 			}
 
 			return true;
@@ -4934,7 +5002,7 @@ namespace bgfx { namespace eacp
 		PipelineQuery m_lastQuery = {}; // what m_lastPipeline was looked up for
 
 		TextureEacp m_textures[BGFX_CONFIG_MAX_TEXTURES];
-		TextureEacp m_fallback[2]; // 2D, cube
+		TextureEacp m_fallback[5]; // by GPU::TextureType: 2D, cube, 2D array, cube array, 3D
 		TextureEacp m_fallbackDepth;
 		FrameBufferEacp m_frameBuffers[BGFX_CONFIG_MAX_FRAME_BUFFERS];
 		std::unordered_map<uint64_t, GPU::Sampler> m_samplers;
