@@ -75,6 +75,14 @@ namespace entry
 
 	int main(int _argc, const char* const* _argv);
 
+#if ENTRY_CONFIG_USE_NATIVE && BX_PLATFORM_OSX
+	/// The stock macOS entry layer's headless capture (entry_osx.mm,
+	/// EACP_BGFX_CAPTURE): called on the API thread after every update, where
+	/// it settles with the render thread and requests the screenshot of the
+	/// chosen rendered frame.
+	void captureAfterUpdate();
+#endif // ENTRY_CONFIG_USE_NATIVE && BX_PLATFORM_OSX
+
 	char keyToAscii(Key::Enum _key, uint8_t _modifiers);
 
 	struct Event

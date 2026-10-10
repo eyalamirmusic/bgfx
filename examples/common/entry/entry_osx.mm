@@ -14,6 +14,11 @@
 #include <bx/thread.h>
 #include <bx/os.h>
 #include <bx/handlealloc.h>
+#include <bx/file.h>
+
+#include <atomic>
+#include <stdio.h>
+#include <stdlib.h>
 
 @interface AppDelegate : NSObject<NSApplicationDelegate>
 {
@@ -77,6 +82,76 @@ namespace entry
 			[NSApp terminate:nil];
 			return result;
 		}
+	};
+
+	/// Headless capture, the stock half of the eacp capture mode
+	/// (entry_eacp.cpp) behind the same variables: EACP_BGFX_CAPTURE=<path.png>
+	/// runs the example with its window made but never ordered front, never
+	/// key, and the app never active (activation policy Prohibited: no Dock
+	/// icon, no menu bar, no focus change), saves rendered frame
+	/// EACP_BGFX_CAPTURE_FRAME (default 120, counted in frames bgfx rendered,
+	/// as the eacp side counts them) as an opaque PNG through
+	/// bgfx::requestScreenShot, and exits through the normal shutdown.
+	/// EACP_BGFX_CAPTURE_HIDPI=1 presses F10 after the first frame.
+	///
+	/// Metal renders an occluded window (one never shown is) into a texture
+	/// of the drawable's size instead of asking the layer for a drawable, and
+	/// a screenshot frame renders into the swap chain's screenshot target
+	/// either way, so nothing here needs the window on screen.
+	///
+	/// The frame is exact: after every update the API thread waits until the
+	/// render thread has rendered everything posted so far (a renderFrame call
+	/// that began after the update and timed out), so it knows the number of
+	/// the next rendered frame and requests the screenshot into frame n
+	/// itself. bgfx's default callback writes it as <path>.tga, which the
+	/// render thread turns into the PNG after that frame.
+	struct Capture
+	{
+		Capture()
+		{
+			if (const char* path = getenv("EACP_BGFX_CAPTURE") )
+			{
+				bx::strCopy(m_path, sizeof(m_path), path);
+
+				bx::strCopy(m_shotPath, sizeof(m_shotPath), path);
+				const int32_t len = bx::strLen(m_shotPath);
+				if (4 < len
+				&&  0 == bx::strCmpI(&m_shotPath[len-4], ".png") )
+				{
+					m_shotPath[len-4] = '\0';
+				}
+				bx::strCat(m_shotPath, sizeof(m_shotPath), ".capture");
+			}
+
+			if (const char* frame = getenv("EACP_BGFX_CAPTURE_FRAME") )
+			{
+				const int value = atoi(frame);
+				m_frame = uint32_t(value < 1 ? 1 : value);
+			}
+
+			if (const char* hidpi = getenv("EACP_BGFX_CAPTURE_HIDPI") )
+			{
+				m_hidpi = 0 != atoi(hidpi);
+			}
+		}
+
+		bool enabled() const
+		{
+			return 0 != m_path[0];
+		}
+
+		char     m_path[bx::kMaxFilePath]     = {};
+		char     m_shotPath[bx::kMaxFilePath] = {}; // without the .tga bgfx's callback appends
+		uint32_t m_frame = 120;
+		bool     m_hidpi = false;
+		bool     m_saved = false;      // render thread only
+		bool     m_requested = false;  // API thread only
+
+		std::atomic<uint32_t> m_rendered{0};   // RenderFrame::Render results so far
+		std::atomic<uint32_t> m_request{0};    // API thread: settle generation asked for
+		std::atomic<uint32_t> m_idle{0};       // render thread: settle generation reached
+		std::atomic<uint32_t> m_shotFrame{0};  // the rendered frame the screenshot is in
+		std::atomic<bool>     m_done{false};
 	};
 
 	struct Context
@@ -454,8 +529,22 @@ namespace entry
 
 			id dg = [AppDelegate sharedDelegate];
 			[NSApp setDelegate:dg];
-			[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-			[NSApp activateIgnoringOtherApps:YES];
+
+			const bool capture = m_capture.enabled();
+			if (capture)
+			{
+				// Never active, never in the Dock or the app switcher, never
+				// key; and not App Napped while it renders unseen.
+				[NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+				[[NSProcessInfo processInfo]
+					beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep|NSActivityLatencyCritical
+					reason:@"bgfx headless capture"];
+			}
+			else
+			{
+				[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+				[NSApp activateIgnoringOtherApps:YES];
+			}
 			[NSApp finishLaunching];
 
 			[[NSNotificationCenter defaultCenter]
@@ -512,7 +601,14 @@ namespace entry
 
 			while (!(m_exit = [dg applicationHasTerminated]) )
 			{
-				bgfx::renderFrame();
+				if (capture)
+				{
+					captureRenderFrame();
+				}
+				else
+				{
+					bgfx::renderFrame();
+				}
 
 				@autoreleasepool
 				{
@@ -522,12 +618,158 @@ namespace entry
 				}
 			}
 
+			m_capture.m_done = true;
 			m_eventQueue.postExitEvent();
 
 			while (bgfx::RenderFrame::NoContext != bgfx::renderFrame() ) {};
 			thread.shutdown();
 
+			if (capture
+			&&  !m_capture.m_saved)
+			{
+				fprintf(stderr, "stock capture: frame %u never saved (%u rendered)\n", m_capture.m_frame, m_capture.m_rendered.load() );
+				return 1;
+			}
+
 			return 0;
+		}
+
+		/// One render-thread step of the capture mode: a bounded renderFrame,
+		/// so a call that finds nothing posted returns and tells the API
+		/// thread everything it posted has been rendered.
+		void captureRenderFrame()
+		{
+			const uint32_t generation = m_capture.m_request.load(std::memory_order_acquire);
+			const bgfx::RenderFrame::Enum result = bgfx::renderFrame(1);
+
+			if (bgfx::RenderFrame::Render == result)
+			{
+				const uint32_t rendered = m_capture.m_rendered.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+				if (m_capture.m_hidpi
+				&&  1 == rendered)
+				{
+					WindowHandle handle = { 0 };
+					m_eventQueue.postKeyEvent(handle, Key::F10, 0, true);
+					m_eventQueue.postKeyEvent(handle, Key::F10, 0, false);
+				}
+
+				const uint32_t shotFrame = m_capture.m_shotFrame.load(std::memory_order_acquire);
+				if (!m_capture.m_saved
+				&&  0 != shotFrame
+				&&  rendered >= shotFrame)
+				{
+					m_capture.m_saved = true;
+					saveCapture(shotFrame);
+					[NSApp terminate:nil];
+				}
+			}
+			else if (bgfx::RenderFrame::Timeout == result)
+			{
+				m_capture.m_idle.store(generation, std::memory_order_release);
+			}
+		}
+
+		/// The default callback's TGA (BGRA, top-left origin, 18-byte header)
+		/// into an opaque PNG.
+		void saveCapture(uint32_t _frame)
+		{
+			char tgaPath[bx::kMaxFilePath];
+			bx::strCopy(tgaPath, sizeof(tgaPath), m_capture.m_shotPath);
+			bx::strCat(tgaPath, sizeof(tgaPath), ".tga");
+
+			NSData* tga = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:tgaPath] ];
+			const uint8_t* bytes = (const uint8_t*)[tga bytes];
+
+			if (nil == tga
+			||  18 > [tga length]
+			||  32 != bytes[16])
+			{
+				fprintf(stderr, "stock capture: no screenshot at %s\n", tgaPath);
+				return;
+			}
+
+			const uint32_t width  = bytes[12] | (uint32_t(bytes[13])<<8);
+			const uint32_t height = bytes[14] | (uint32_t(bytes[15])<<8);
+			const bool     topDown = 0 != (bytes[17] & 0x20);
+
+			if ([tga length] < 18 + bytes[0] + size_t(width)*height*4)
+			{
+				fprintf(stderr, "stock capture: short screenshot at %s\n", tgaPath);
+				return;
+			}
+
+			NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
+				initWithBitmapDataPlanes:NULL
+				pixelsWide:width
+				pixelsHigh:height
+				bitsPerSample:8
+				samplesPerPixel:4
+				hasAlpha:YES
+				isPlanar:NO
+				colorSpaceName:NSDeviceRGBColorSpace
+				bytesPerRow:width*4
+				bitsPerPixel:32
+				];
+
+			const uint8_t* src = bytes + 18 + bytes[0];
+			uint8_t* dst = [rep bitmapData];
+
+			for (uint32_t yy = 0; yy < height; ++yy)
+			{
+				const uint8_t* row = src + size_t(topDown ? yy : height-1-yy)*width*4;
+				uint8_t* out = dst + size_t(yy)*width*4;
+
+				for (uint32_t xx = 0; xx < width; ++xx)
+				{
+					out[xx*4+0] = row[xx*4+2];
+					out[xx*4+1] = row[xx*4+1];
+					out[xx*4+2] = row[xx*4+0];
+					out[xx*4+3] = 255;
+				}
+			}
+
+			NSData* png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+			[png writeToFile:[NSString stringWithUTF8String:m_capture.m_path] atomically:YES];
+			[rep release];
+
+			bx::remove(tgaPath);
+
+			fprintf(stderr, "stock capture: frame %u, %ux%u, saved to %s\n", _frame, width, height, m_capture.m_path);
+		}
+
+		/// API thread, after every update: wait until all it has posted is
+		/// rendered, then the next rendered frame is the one after; request
+		/// the screenshot when that is the chosen frame (or the first after it,
+		/// if an update posted several).
+		void captureAfterUpdate()
+		{
+			if (!m_capture.enabled()
+			||  m_capture.m_requested)
+			{
+				return;
+			}
+
+			const uint32_t generation = m_capture.m_request.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+			while (m_capture.m_idle.load(std::memory_order_acquire) < generation)
+			{
+				if (m_capture.m_done.load() )
+				{
+					return;
+				}
+
+				bx::yield();
+			}
+
+			const uint32_t next = m_capture.m_rendered.load(std::memory_order_acquire) + 1;
+
+			if (next >= m_capture.m_frame)
+			{
+				m_capture.m_requested = true;
+				bgfx::requestScreenShot(BGFX_INVALID_HANDLE, m_capture.m_shotPath);
+				m_capture.m_shotFrame.store(next, std::memory_order_release);
+			}
 		}
 
 		WindowHandle findHandle(NSWindow *_window)
@@ -548,6 +790,7 @@ namespace entry
 		}
 
 		EventQueue m_eventQueue;
+		Capture m_capture;
 		bx::Mutex m_lock;
 
 		bx::HandleAllocT<ENTRY_CONFIG_MAX_WINDOWS> m_windowAlloc;
@@ -567,6 +810,11 @@ namespace entry
 	};
 
 	static Context s_ctx;
+
+	void captureAfterUpdate()
+	{
+		s_ctx.captureAfterUpdate();
+	}
 
 	const Event* poll()
 	{
@@ -602,7 +850,10 @@ namespace entry
 					];
 				NSString* appName = [NSString stringWithUTF8String:_title];
 				[window setTitle:appName];
-				[window makeKeyAndOrderFront:window];
+				if (!s_ctx.m_capture.enabled() )
+				{
+					[window makeKeyAndOrderFront:window];
+				}
 				[window setAcceptsMouseMovedEvents:YES];
 				[window setBackgroundColor:[NSColor blackColor]];
 				[[Window sharedDelegate] windowCreated:window];

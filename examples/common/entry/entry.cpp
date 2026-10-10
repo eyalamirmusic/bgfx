@@ -10,6 +10,7 @@
 #include <bx/timer.h>
 #include <bgfx/bgfx.h>
 
+#include <stdlib.h> // getenv, atof
 #include <time.h>
 
 #if BX_PLATFORM_EMSCRIPTEN
@@ -594,11 +595,28 @@ BX_PRAGMA_DIAGNOSTIC_POP();
 				? bx::Ticks(bx::Ticks::s_kFreq.ticks/fps)
 				: bx::Ticks(bx::InitZero)
 				;
+
+			// EACP_BGFX_FIXED_STEP=<seconds>: every FrameTime (and imgui and the
+			// example glue) advances by exactly this much per frame, so a capture
+			// of frame n is at the same time on every backend and entry layer.
+			if (const char* step = getenv("EACP_BGFX_FIXED_STEP") )
+			{
+				const double seconds = atof(step);
+
+				if (0.0 < seconds)
+				{
+					s_fixedTimeStep = bx::Ticks(int64_t(seconds*double(bx::Ticks::s_kFreq.ticks) + 0.5) );
+				}
+			}
 		}
 
 		///
 		bool frame()
 		{
+#if ENTRY_CONFIG_USE_NATIVE && BX_PLATFORM_OSX
+			captureAfterUpdate();
+#endif // ENTRY_CONFIG_USE_NATIVE && BX_PLATFORM_OSX
+
 			if (0 == m_screenshotFrame)
 			{
 				return true;
