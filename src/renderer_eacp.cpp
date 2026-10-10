@@ -19,6 +19,7 @@
 #	include <bimg/bimg.h>
 
 #	include <atomic>
+#	include <map>
 #	include <optional>
 #	include <string>
 #	include <unordered_map>
@@ -340,6 +341,7 @@ namespace bgfx { namespace eacp
 				if (_offset < m_size)
 				{
 					m_static->update(_data, bx::min(_size, m_size - _offset), _offset);
+					++m_version;
 				}
 
 				return;
@@ -411,6 +413,54 @@ namespace bgfx { namespace eacp
 			return GPU::BufferRange::of(*slot.m_buffer);
 		}
 
+		/// What stock Metal's fallback attribute reads from this buffer as
+		/// stream 0 of a layout of _stride bytes: the first two bytes of
+		/// each vertex as unnormalised UChar2, here two floats per vertex
+		/// (eacp has no unnormalised byte format, G104). Built on the CPU
+		/// once per contents and stride.
+		GPU::BufferRange byteFallback(uint32_t _stride, GPU::StreamingBuffers& _stream)
+		{
+			if (m_fallbackStride != _stride
+			||  m_fallbackVersion != m_version)
+			{
+				std::vector<uint8_t> source;
+				const uint8_t* bytes = m_shadow.data();
+
+				if (m_static)
+				{
+					source.resize(m_size);
+					m_static->read(source.data(), m_size, 0);
+					bytes = source.data();
+				}
+
+				const uint32_t numVertices = bx::max<uint32_t>(m_size/bx::max<uint32_t>(_stride, 1), 1);
+				m_fallback.assign(numVertices*2, 0.0f);
+
+				for (uint32_t ii = 0; ii < numVertices && size_t(ii*_stride + 1) < size_t(m_size); ++ii)
+				{
+					m_fallback[ii*2+0] = float(bytes[ii*_stride+0]);
+					m_fallback[ii*2+1] = float(bytes[ii*_stride+1]);
+				}
+
+				m_fallbackStride  = _stride;
+				m_fallbackVersion = m_version;
+				m_fallbackBuffer.reset();
+
+				if (m_static
+				&&  !m_storage)
+				{
+					m_fallbackBuffer.emplace(GPU::Device::shared().makeBuffer(m_fallback.data(), int64_t(m_fallback.size()*sizeof(float) ), GPU::BufferUsage::Vertex) );
+				}
+			}
+
+			if (m_fallbackBuffer)
+			{
+				return GPU::BufferRange::of(*m_fallbackBuffer);
+			}
+
+			return _stream.write(m_fallback.data(), int64_t(m_fallback.size()*sizeof(float) ) );
+		}
+
 		struct Slot
 		{
 			std::optional<GPU::Buffer> m_buffer;
@@ -429,6 +479,11 @@ namespace bgfx { namespace eacp
 		uint32_t m_highWater = 0;
 		uint64_t m_version   = 0;
 		Slot m_slots[kNumSlots];
+
+		std::vector<float> m_fallback; // byteFallback's
+		std::optional<GPU::Buffer> m_fallbackBuffer;
+		uint32_t m_fallbackStride  = 0;
+		uint64_t m_fallbackVersion = UINT64_MAX;
 	};
 
 	struct ShaderEacp
@@ -1656,6 +1711,7 @@ namespace bgfx { namespace eacp
 	{
 		std::optional<GPU::RenderPipeline> m_pipeline;
 		uint16_t m_program;
+		uint8_t  m_fallbackSlot = UINT8_MAX; // the vertex buffer slot the attributes no stream carries read (translateLayout)
 	};
 
 	/// Makes a pass from inside std::optional::emplace: RenderPass can be neither
@@ -3392,9 +3448,13 @@ namespace bgfx { namespace eacp
 			return NULL == m_view || m_view->hasDepth();
 		}
 
+		/// Without a view (a headless device, no swap chain's nwh) the window
+		/// passes go into m_windowProxy, which then has bgfx's default
+		/// depth-stencil (D24S8) planes, and nothing reaches the drawable,
+		/// whose planes the backend cannot see (G103).
 		bool windowHasStencil() const
 		{
-			return NULL != m_view && m_view->hasStencil();
+			return NULL == m_view || m_view->hasStencil();
 		}
 
 		int windowSampleCount() const
@@ -3458,10 +3518,13 @@ namespace bgfx { namespace eacp
 
 		/// The vertex layout a program's [[attribute(n)]] list asks for, out of
 		/// the draw's streams (stream k at Metal buffer k) and its instance data
-		/// (at buffer numStreams, 16 bytes per i_dataN).
-		GPU::VertexLayout translateLayout(const ProgramEacp& _program, uint8_t _numStreams, const VertexLayout** _layouts, uint8_t _numInstanceData)
+		/// (at buffer numStreams, 16 bytes per i_dataN). An attribute none
+		/// of them carries reads _fallbackSlot, the slot after them, where
+		/// bindFallbackSource puts stream 0's byteFallback (or zeros).
+		GPU::VertexLayout translateLayout(const ProgramEacp& _program, uint8_t _numStreams, const VertexLayout** _layouts, uint8_t _numInstanceData, uint8_t& _fallbackSlot)
 		{
 			GPU::VertexLayout result;
+			_fallbackSlot = UINT8_MAX;
 
 			for (uint8_t stream = 0; stream < _numStreams; ++stream)
 			{
@@ -3471,11 +3534,6 @@ namespace bgfx { namespace eacp
 			if (0 < _numInstanceData)
 			{
 				result.buffer(_numStreams, _numInstanceData*16, GPU::StepRate::PerInstance);
-			}
-
-			if (result.buffers.empty() )
-			{
-				result.buffer(0, 4, GPU::StepRate::PerVertex);
 			}
 
 			for (uint32_t location = 0; location < _program.m_numAttributes; ++location)
@@ -3521,16 +3579,99 @@ namespace bgfx { namespace eacp
 
 				if (!found)
 				{
-					// What the stream does not carry reads the first bytes of
-					// stream 0 rather than failing the pipeline, as Metal's
-					// fallback attribute does.
-					BX_TRACE("eacp: attribute(%d) is not in the draw's streams.", location);
+					// What no stream carries reads what stock Metal's
+					// fallback attribute does (renderer_mtl.cpp): the first
+					// two bytes of each of stream 0's vertices as
+					// unnormalised UChar2, so values 0 to 255 (G99).
+					// 43-denoise's meshes without UVs then have UVs whose
+					// gradients pick their textures' smallest mips, an even
+					// colour, where 0..1 of UByte4Norm drew bark-like noise
+					// and a constant UV no normal at all. eacp has neither
+					// the format nor a constant step function (G104): the
+					// bytes come from a Float2 copy of them
+					// (BufferEacp::byteFallback), and without a stream from
+					// zeros stepped per instance.
+					BX_TRACE("eacp: attribute(%d) is not in the draw's streams; it reads stream 0's first bytes.", location);
+
+					_fallbackSlot   = uint8_t(_numStreams + (0 < _numInstanceData ? 1 : 0) );
+					format      = 0 < _numStreams ? GPU::VertexFormat::Float2 : GPU::VertexFormat::UByte4Norm;
+					offset      = 0;
+					bufferIndex = _fallbackSlot;
 				}
 
 				result.attribute(format, offset, bufferIndex);
 			}
 
+			if (UINT8_MAX != _fallbackSlot)
+			{
+				if (0 < _numStreams)
+				{
+					result.buffer(_fallbackSlot, 8, GPU::StepRate::PerVertex);
+				}
+				else
+				{
+					result.buffer(_fallbackSlot, 4, GPU::StepRate::PerInstance);
+				}
+			}
+
+			if (result.buffers.empty() )
+			{
+				result.buffer(0, 4, GPU::StepRate::PerVertex);
+			}
+
 			return result;
+		}
+
+		/// What a pipeline's missing attributes read (translateLayout),
+		/// bound at its slot: stream 0's byte fallback from _startVertex
+		/// when the draw has streams, else a zero buffer of 4 bytes per
+		/// instance for at least _numInstances (an indirect draw's count is
+		/// the GPU's: the buffer's 64K instances then).
+		void bindFallbackSource(GPU::RenderPass& _pass, const PipelineEacp& _pipeline, uint32_t _numInstances, BoundStream* _bound = NULL, BufferEacp* _stream0 = NULL, uint32_t _stride = 0, uint32_t _startVertex = 0)
+		{
+			if (UINT8_MAX == _pipeline.m_fallbackSlot)
+			{
+				return;
+			}
+
+			if (NULL != _stream0)
+			{
+				GPU::BufferRange range = _stream0->byteFallback(_stride, m_vertexStream);
+				range.offset += int64_t(_startVertex)*8;
+				range.bytes   = bx::max<int64_t>(range.bytes - int64_t(_startVertex)*8, 0);
+
+				if (NULL == _bound
+				||  _bound->set(range) )
+				{
+					_pass.setVertexBuffer(range, _pipeline.m_fallbackSlot);
+				}
+
+				return;
+			}
+
+			const int64_t bytes = int64_t(bx::max<uint32_t>(_numInstances, 1) )*4;
+
+			if (!m_zeroSource
+			||  m_zeroSourceBytes < bytes)
+			{
+				if (m_zeroSource)
+				{
+					// Kept: frames in flight may still read it.
+					m_zeroSourceRetired.emplace_back(std::move(*m_zeroSource) );
+				}
+
+				m_zeroSourceBytes = bx::max<int64_t>(int64_t(bx::nextPow2(uint32_t(bytes) ) ), 1<<18);
+				const std::vector<uint8_t> zero(size_t(m_zeroSourceBytes), 0);
+				m_zeroSource.emplace(GPU::Device::shared().makeBuffer(zero.data(), m_zeroSourceBytes, GPU::BufferUsage::Vertex) );
+			}
+
+			const GPU::BufferRange range = GPU::BufferRange::of(*m_zeroSource);
+
+			if (NULL == _bound
+			||  _bound->set(range) )
+			{
+				_pass.setVertexBuffer(range, _pipeline.m_fallbackSlot);
+			}
 		}
 
 		/// The blend of one colour attachment from bgfx's packing: the state
@@ -3700,7 +3841,7 @@ namespace bgfx { namespace eacp
 
 				GPU::RenderPipelineDescriptor desc;
 				desc.library      = &*program.m_library;
-				desc.vertexLayout = translateLayout(program, _numStreams, _layouts, _numInstanceData);
+				desc.vertexLayout = translateLayout(program, _numStreams, _layouts, _numInstanceData, entry->m_fallbackSlot);
 				desc.colorFormat  = m_target.m_colorFormat[0];
 				desc.sampleCount  = m_target.m_sampleCount;
 
@@ -3843,6 +3984,7 @@ namespace bgfx { namespace eacp
 			_pass.setStencilReference(_clear.m_stencil);
 			bindUniforms(_pass, program);
 			_pass.setVertexBuffer(m_vertexBuffers[_clearQuad.m_vb.idx]->range(m_vertexStream), 0);
+			bindFallbackSource(_pass, *pipeline, 1, NULL, m_vertexBuffers[_clearQuad.m_vb.idx], layout->getStride() );
 			_pass.draw(4);
 		}
 
@@ -4058,10 +4200,14 @@ namespace bgfx { namespace eacp
 			// backbuffer's size and that is drawn onto the drawable at the end
 			// of the frame (presentWindowProxy), nearest at a whole scale,
 			// linear otherwise (G92).
-			if (!s_hiDpi
-			&&  (1.0f != m_windowScaleX || 1.0f != m_windowScaleY)
-			&&  0.0f < size.x
-			&&  0.0f < size.y)
+			//
+			// A headless device (no view) renders its window passes into that
+			// target too and never draws it onto the drawable (G103).
+			if (NULL == m_view
+			||  (!s_hiDpi
+			&&   (1.0f != m_windowScaleX || 1.0f != m_windowScaleY)
+			&&   0.0f < size.x
+			&&   0.0f < size.y) )
 			{
 				if (!m_windowProxy
 				||  m_windowProxy->width()       != int(m_backbufferWidth)
@@ -4087,7 +4233,7 @@ namespace bgfx { namespace eacp
 				}
 
 				if (m_windowProxy
-				&&  makeUpscalePipeline() )
+				&&  (NULL == m_view || makeUpscalePipeline() ) )
 				{
 					m_windowProxied = true;
 					m_windowScaleX  = 1.0f;
@@ -4097,19 +4243,19 @@ namespace bgfx { namespace eacp
 		}
 
 		/// The fullscreen triangle presentWindowProxy draws the window's
-		/// target onto the drawable with.
+		/// target onto the drawable with: one pipeline per sample count and
+		/// planes of the drawable's pass, which are the view's, whatever
+		/// depth-stencil format and MSAA bgfx's reset asked for (G100).
 		bool makeUpscalePipeline()
 		{
-			// Remade when the drawable's sample count or planes change.
 			const int key = windowSampleCount()*4 + (windowHasDepth() ? 2 : 0) + (windowHasStencil() ? 1 : 0);
 
-			if (m_upscalePipeline
-			&&  key == m_upscaleKey)
-			{
-				return m_upscalePipeline->isValid();
-			}
+			m_upscalePipeline = &m_upscalePipelines[key];
 
-			m_upscaleKey = key;
+			if (*m_upscalePipeline)
+			{
+				return (*m_upscalePipeline)->isValid();
+			}
 
 			static const char* s_upscale =
 				"#include <metal_stdlib>\n"
@@ -4129,10 +4275,13 @@ namespace bgfx { namespace eacp
 				"}\n"
 				;
 
-			GPU::ShaderSource source = GPU::ShaderSource::msl(s_upscale);
-			source.withVertex("upscaleVertex");
-			source.withFragment("upscaleFragment");
-			m_upscaleLibrary.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+			if (!m_upscaleLibrary)
+			{
+				GPU::ShaderSource source = GPU::ShaderSource::msl(s_upscale);
+				source.withVertex("upscaleVertex");
+				source.withFragment("upscaleFragment");
+				m_upscaleLibrary.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+			}
 
 			GPU::RenderPipelineDescriptor desc;
 			desc.library      = &*m_upscaleLibrary;
@@ -4143,14 +4292,14 @@ namespace bgfx { namespace eacp
 			desc.depthWrite   = false;
 			desc.stencil      = windowHasStencil();
 			desc.cullMode     = GPU::CullMode::None;
-			m_upscalePipeline.emplace(GPU::Device::shared().makeRenderPipeline(desc) );
+			m_upscalePipeline->emplace(GPU::Device::shared().makeRenderPipeline(desc) );
 
-			if (!m_upscalePipeline->isValid() )
+			if (!(*m_upscalePipeline)->isValid() )
 			{
 				BX_TRACE("eacp: the window upscale pipeline does not build; the window renders at the drawable's size.");
 			}
 
-			return m_upscalePipeline->isValid();
+			return (*m_upscalePipeline)->isValid();
 		}
 
 		/// The window's target of the backbuffer's size drawn onto the
@@ -4163,6 +4312,12 @@ namespace bgfx { namespace eacp
 			}
 
 			endPass();
+
+			if (NULL == m_view
+			||  NULL == m_upscalePipeline)
+			{
+				return;
+			}
 
 			const ::eacp::Graphics::Point size = _frame.pixelSize();
 			const bool whole = true
@@ -4178,7 +4333,7 @@ namespace bgfx { namespace eacp
 			m_pass.emplace(PassMaker{ _frame, descriptor, NULL });
 			m_pass->setViewport({ 0.0f, 0.0f, float(size.x), float(size.y) }, 0.0f, 1.0f);
 			m_pass->setScissorRect({ 0.0f, 0.0f, float(size.x), float(size.y) });
-			m_pass->setPipeline(*m_upscalePipeline);
+			m_pass->setPipeline(**m_upscalePipeline);
 			m_pass->setFragmentTexture(*m_windowProxy, 0, getSampler(whole ? BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP : BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
 			m_pass->draw(3);
 			m_needFlush = true;
@@ -4550,7 +4705,7 @@ namespace bgfx { namespace eacp
 			// vertex stream is not sent again: eacp's setPipeline re-encodes
 			// the depth-stencil state, winding and cull mode on every call.
 			const PipelineEacp* currentPipeline = NULL;
-			BoundStream currentStreams[BGFX_CONFIG_MAX_VERTEX_STREAMS+1];
+			BoundStream currentStreams[BGFX_CONFIG_MAX_VERTEX_STREAMS+2]; // the streams, the instance data, the zero source
 
 			viewState.m_rect = _render->view(0).m_rect;
 
@@ -4784,6 +4939,21 @@ namespace bgfx { namespace eacp
 					{
 						pass.setVertexBuffer(range, numStreams);
 					}
+				}
+
+				if (UINT8_MAX != pipeline->m_fallbackSlot)
+				{
+					BufferEacp* stream0 = NULL;
+					uint32_t startVertex = 0;
+
+					if (0 < numStreams)
+					{
+						const Stream& stream = draw.m_stream[bx::countTrailingZeros(draw.m_streamMask)];
+						stream0     = m_vertexBuffers[stream.m_handle.idx];
+						startVertex = stream.m_startVertex;
+					}
+
+					bindFallbackSource(pass, *pipeline, draw.m_numInstances, &currentStreams[pipeline->m_fallbackSlot], stream0, layouts[0]->getStride(), startVertex);
 				}
 
 				const uint32_t ref = (unpackStencil(0, draw.m_stencil)&BGFX_STENCIL_FUNC_REF_MASK)>>BGFX_STENCIL_FUNC_REF_SHIFT;
@@ -5430,6 +5600,7 @@ namespace bgfx { namespace eacp
 
 			pass.setFragmentTexture(*texture.m_texture, 0, getSampler(uint32_t(texture.m_flags), 0, UINT8_MAX) );
 			pass.setVertexBuffer(vb->range(m_vertexStream), 0);
+			bindFallbackSource(pass, *pipeline, 1, NULL, vb, layout->getStride() );
 			pass.drawIndexed(ib->range(m_indexStream), int(_numIndices), GPU::IndexFormat::UInt16, 0);
 
 			m_lastPipelineKey = 0;
@@ -5493,9 +5664,12 @@ namespace bgfx { namespace eacp
 		float    m_passScaleX       = 1.0f;           // the open pass's target pixels per bgfx unit
 		float    m_passScaleY       = 1.0f;
 		std::optional<GPU::Texture>        m_windowProxy;     // the window's passes' target without BGFX_RESET_HIDPI on a scaled drawable (updateWindowScale)
+		std::optional<GPU::Buffer>         m_zeroSource;      // what attributes no stream carries read in a draw without streams (bindFallbackSource)
+		std::vector<GPU::Buffer>           m_zeroSourceRetired;
+		int64_t  m_zeroSourceBytes  = 0;
 		std::optional<GPU::ShaderLibrary>  m_upscaleLibrary;  // ... drawn onto the drawable through these
-		std::optional<GPU::RenderPipeline> m_upscalePipeline;
-		int      m_upscaleKey       = 0;
+		std::map<int, std::optional<GPU::RenderPipeline> > m_upscalePipelines; // ... per sample count and planes of the drawable
+		std::optional<GPU::RenderPipeline>* m_upscalePipeline = NULL;            // ... this frame's
 		bool     m_windowProxied    = false;          // this frame's window passes go into m_windowProxy
 		float    m_windowScaleX     = 1.0f;           // drawable pixels per backbuffer unit
 		float    m_windowScaleY     = 1.0f;
