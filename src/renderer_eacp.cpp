@@ -72,7 +72,7 @@ namespace bgfx { namespace eacp
 			BlitLevel,          // G6, G15
 			BlitWidened,        // G4
 			BlitShadow,         // G32
-			Indirect,           // G8
+			Indirect,
 			Msaa,               // window is sample count 1
 			Capture,            // G34
 			OcclusionQuery,     // G10
@@ -1732,16 +1732,22 @@ namespace bgfx { namespace eacp
 
 			// IMAGE_RW: a compute-write texture is ShaderRead|ShaderWrite, and
 			// every Apple GPU eacp runs on is read-write tier 2, which reads and
-			// writes RGBA8, RGBA16F and RGBA32F in one kernel. No DRAW_INDIRECT
-			// (G8): eacp dispatches indirectly but cannot draw indirectly, and
-			// bgfx has one bit for both.
+			// writes RGBA8, RGBA16F and RGBA32F in one kernel.
 			// BLEND_INDEPENDENT: a pipeline blends each of a pass's colour
 			// attachments by its own ColorTargetState (G3).
+			// DRAW_INDIRECT: RenderPass::drawIndirect and drawIndexedIndirect
+			// read bgfx's records, and ComputePass::dispatchIndirect its
+			// dispatches (one bit for both). DRAW_INDIRECT_COUNT only where the
+			// device draws a count read from a buffer, which Metal does not;
+			// bgfx asserts on the count form of submit without it, and in a
+			// build without asserts eacp refuses the draw with a trace.
 			g_caps.supported |= 0
 				| BGFX_CAPS_COMPUTE
 				| BGFX_CAPS_INDEX32
 				| BGFX_CAPS_IMAGE_RW
 				| BGFX_CAPS_BLEND_INDEPENDENT
+				| BGFX_CAPS_DRAW_INDIRECT
+				| (device.supportsIndirectCount() ? BGFX_CAPS_DRAW_INDIRECT_COUNT : 0)
 				;
 
 			fillFormatCaps(device);
@@ -1754,7 +1760,10 @@ namespace bgfx { namespace eacp
 			g_caps.limits.maxTextureLayers    = 1;
 			g_caps.limits.maxFBAttachments    = bx::min<uint32_t>(GPU::maxColorAttachments, BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS);
 			g_caps.limits.maxTextureSamplers  = bx::min<uint32_t>(g_caps.limits.maxTextureSamplers, 8);
-			g_caps.limits.maxComputeBindings  = bx::min<uint32_t>(BGFX_MAX_COMPUTE_BINDINGS, 8);
+			// The device's own storage-buffer slots for a kernel (16 on Metal, 8
+			// on D3D12), within bgfx's bind array; a compute stage's texture or
+			// image binds at texture(stage), which Metal has as many of.
+			g_caps.limits.maxComputeBindings  = bx::min<uint32_t>(BGFX_MAX_COMPUTE_BINDINGS, uint32_t(bx::max(device.maxComputeBufferSlots(), 0) ) );
 			g_caps.limits.maxVertexStreams    = BGFX_CONFIG_MAX_VERTEX_STREAMS;
 			g_caps.limits.maxVertexAttributes = 16;
 
@@ -2795,9 +2804,13 @@ namespace bgfx { namespace eacp
 		/// A render stage's storage buffers: eacp-metal declares stage n at
 		/// buffer(24 + n) in both stages, RenderPass::bufferBase, which is where
 		/// setVertexStorageBuffer and setFragmentStorageBuffer bind slot n.
+		/// Metal's argument table ends at buffer(30), so a render stage has
+		/// seven storage slots however many a kernel has.
 		void bindRenderStorage(GPU::RenderPass& _pass, const RenderBind& _renderBind)
 		{
-			for (uint8_t stage = 0; stage < g_caps.limits.maxComputeBindings; ++stage)
+			const uint32_t numStages = bx::min<uint32_t>(g_caps.limits.maxComputeBindings, 31 - GPU::RenderPass::bufferBase);
+
+			for (uint8_t stage = 0; stage < numStages; ++stage)
 			{
 				const Binding& bind = _renderBind.m_bind[stage];
 
@@ -2972,9 +2985,10 @@ namespace bgfx { namespace eacp
 					return;
 				}
 
-				const uint32_t numIndirect = UINT32_MAX == _compute.m_numIndirect
-					? args->m_size/BGFX_CONFIG_DRAW_INDIRECT_STRIDE
-					: _compute.m_numIndirect
+				const uint32_t numRecords  = args->m_size/BGFX_CONFIG_DRAW_INDIRECT_STRIDE;
+				const uint32_t numIndirect = _compute.m_startIndirect < numRecords
+					? bx::min(numRecords - _compute.m_startIndirect, _compute.m_numIndirect)
+					: 0
 					;
 
 				uint32_t offset = _compute.m_startIndirect*BGFX_CONFIG_DRAW_INDIRECT_STRIDE;
@@ -4087,12 +4101,6 @@ namespace bgfx { namespace eacp
 					continue;
 				}
 
-				if (isValid(draw.m_indirectBuffer) )
-				{
-					traceOnce(Unsupported::Indirect, "G8: indirect draws are skipped.");
-					continue;
-				}
-
 				ProgramEacp* program = m_program[key.m_program.idx];
 
 				if (NULL == program
@@ -4271,6 +4279,12 @@ namespace bgfx { namespace eacp
 					bindRenderStorage(pass, renderBind);
 				}
 
+				if (isValid(draw.m_indirectBuffer) )
+				{
+					submitIndirect(pass, draw);
+					continue;
+				}
+
 				const uint8_t primIndex = uint8_t( (state&BGFX_STATE_PT_MASK)>>BGFX_STATE_PT_SHIFT);
 				const PrimInfo& prim = s_primInfo[primIndex];
 				const uint32_t numInstances = bx::max<uint32_t>(draw.m_numInstances, 1);
@@ -4344,6 +4358,83 @@ namespace bgfx { namespace eacp
 			}
 
 			noteViewTime(UINT16_MAX);
+		}
+
+		/// An indirect draw, everything but the draw itself set up as for a
+		/// direct one. bgfx's records are BGFX_CONFIG_DRAW_INDIRECT_STRIDE bytes
+		/// apart and begin with eacp's DrawArguments or DrawIndexedArguments;
+		/// each record's firstIndex counts from the start of the index buffer.
+		/// The count form, with the number of draws in a uint32 of an index
+		/// buffer, is reached only where BGFX_CAPS_DRAW_INDIRECT_COUNT is set.
+		/// The primitives drawn are on the GPU, so the stats do not count them.
+		void submitIndirect(GPU::RenderPass& _pass, const RenderDraw& _draw)
+		{
+			BufferEacp* args = m_vertexBuffers[_draw.m_indirectBuffer.idx];
+
+			if (NULL == args
+			||  !args->m_static)
+			{
+				return;
+			}
+
+			const uint32_t numRecords = args->m_size/BGFX_CONFIG_DRAW_INDIRECT_STRIDE;
+
+			if (_draw.m_startIndirect >= numRecords)
+			{
+				return;
+			}
+
+			const uint32_t numDrawIndirect = bx::min(numRecords - _draw.m_startIndirect, _draw.m_numIndirect);
+			const int64_t  offset          = int64_t(_draw.m_startIndirect)*BGFX_CONFIG_DRAW_INDIRECT_STRIDE;
+			const int64_t  stride          = BGFX_CONFIG_DRAW_INDIRECT_STRIDE;
+
+			const GPU::Buffer* count = NULL;
+			int64_t countOffset      = 0;
+
+			if (isValid(_draw.m_numIndirectBuffer) )
+			{
+				BufferEacp* num = m_indexBuffers[_draw.m_numIndirectBuffer.idx];
+
+				if (NULL == num
+				||  !num->m_static)
+				{
+					traceOnce(Unsupported::Indirect, "an indirect draw count in a buffer no kernel writes is skipped.");
+					return;
+				}
+
+				count       = &*num->m_static;
+				countOffset = int64_t(_draw.m_numIndirectIndex)*sizeof(uint32_t);
+			}
+
+			if (isValid(_draw.m_indexBuffer) )
+			{
+				BufferEacp* ib = m_indexBuffers[_draw.m_indexBuffer.idx];
+
+				if (NULL == ib)
+				{
+					return;
+				}
+
+				const GPU::IndexFormat format = _draw.isIndex16() ? GPU::IndexFormat::UInt16 : GPU::IndexFormat::UInt32;
+				const GPU::BufferRange range  = ib->range(m_indexStream);
+
+				if (NULL != count)
+				{
+					_pass.drawIndexedIndirectCount(range, format, *args->m_static, offset, *count, countOffset, int(numDrawIndirect), stride);
+				}
+				else
+				{
+					_pass.drawIndexedIndirect(range, format, *args->m_static, offset, int(numDrawIndirect), stride);
+				}
+			}
+			else if (NULL != count)
+			{
+				_pass.drawIndirectCount(*args->m_static, offset, *count, countOffset, int(numDrawIndirect), stride);
+			}
+			else
+			{
+				_pass.drawIndirect(*args->m_static, offset, int(numDrawIndirect), stride);
+			}
 		}
 
 		/// CPU time per view for BGFX_DEBUG_PROFILER, as the views are walked;
