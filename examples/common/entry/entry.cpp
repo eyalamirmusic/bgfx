@@ -1174,6 +1174,13 @@ restart:
 
 extern "C" bool entry_process_events(uint32_t* _width, uint32_t* _height, uint32_t* _debug, uint32_t* _reset)
 {
+#if ENTRY_CONFIG_USE_NATIVE && BX_PLATFORM_OSX
+	// 25-c99 runs its own loop instead of TestRun::frame: each call here
+	// follows the previous bgfx_frame, which is where the capture mode needs
+	// to know an update has been posted.
+	entry::captureAfterUpdate();
+#endif // ENTRY_CONFIG_USE_NATIVE && BX_PLATFORM_OSX
+
 	return entry::processEvents(*_width, *_height, *_debug, *_reset, NULL);
 }
 
