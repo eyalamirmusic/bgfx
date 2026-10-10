@@ -46,6 +46,8 @@ define shader-embedded
 	-@cat "$(SHADER_TMP)" >> $(@)
 	-$(SILENT) $(SHADERC) --type $(1) --platform ios     -p metal -O 3 -f $(<) -o "$(SHADER_TMP)" --bin2c $(basename $(<))_mtl
 	-@cat "$(SHADER_TMP)" >> $(@)
+	-$(SILENT) $(SHADERC) --type $(1) --platform osx     -p eacp-metal -O 3 -f $(<) -o "$(SHADER_TMP)" --bin2c $(basename $(<))_eacp_mtl
+	-@cat "$(SHADER_TMP)" >> $(@)
 	-@printf "extern const uint8_t* $(basename $(<))_pssl;\n" | tr -d '\015' >> $(@)
 	-@printf "extern const uint32_t $(basename $(<))_pssl_size;\n" | tr -d '\015' >> $(@)
 endef
@@ -98,6 +100,8 @@ define shader-embedded-compute
 	-$(SILENT) $(SHADERC) --type c --platform windows -p s_6_0 -O 3 -f $(<) -o "$(SHADER_TMP)" --bin2c $(basename $(<))_dxil
 	-@cat "$(SHADER_TMP)" >> $(@)
 	-$(SILENT) $(SHADERC) --type c --platform ios     -p metal -O 3 -f $(<) -o "$(SHADER_TMP)" --bin2c $(basename $(<))_mtl
+	-@cat "$(SHADER_TMP)" >> $(@)
+	-$(SILENT) $(SHADERC) --type c --platform osx     -p eacp-metal -O 3 -f $(<) -o "$(SHADER_TMP)" --bin2c $(basename $(<))_eacp_mtl
 	-@cat "$(SHADER_TMP)" >> $(@)
 	-@printf "extern const uint8_t* $(basename $(<))_pssl;\n" | tr -d '\015' >> $(@)
 	-@printf "extern const uint32_t $(basename $(<))_pssl_size;\n" | tr -d '\015' >> $(@)
