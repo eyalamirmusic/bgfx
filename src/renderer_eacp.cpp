@@ -222,41 +222,66 @@ namespace bgfx { namespace eacp
 	};
 	static_assert(Topology::Count == BX_COUNTOF(s_primInfo) );
 
-	// bgfx's attribute type, count and normalisation as the nearest eacp vertex
-	// format. What eacp has: Float x1..4, UByte4Norm, Half2/4, Short2/4Norm, and
-	// no integer format at all. The rest (non-normalised integers, Uint10) is G7.
-	// A non-normalised one is given the normalised format of its size: right for
-	// a shader input declared float (it reads 0..1 rather than 0..255), refused
-	// by Metal when the input is declared integer (uvec4 a_indices), in which
-	// case the pipeline is invalid and its draws are skipped.
-	static GPU::VertexFormat toVertexFormat(uint8_t _num, AttribType::Enum _type, bool _normalized, bool _asInt)
+	/// bgfx's attribute type, count and normalisation as the eacp vertex
+	/// format (G7), for a shader input the MSL declares integer
+	/// (_integerInput: uint4 a_indices) or float. A format without Norm is
+	/// read as an integer, which D3D12 and Vulkan require the input to be
+	/// declared as, so a non-normalised Uint8 or Int16 is the integer format
+	/// only where the input is an integer: a float input is given the Norm
+	/// format of its size, reading 0..1 (or -1..1) where stock Metal's integer
+	/// format read 0..255 (no example does this; debugdraw's indices are
+	/// uvec4). An integer input always gets the integer format, normalised or
+	/// not, since a Norm format feeding one fails the pipeline. asInt changes
+	/// nothing on the GPU, as in renderer_mtl.cpp: bgfx's meshes pack normals
+	/// as Uint8 normalized asInt and the shader unpacks. Three components of
+	/// Uint8, Int16 and Half read the four-component format, which bgfx's
+	/// layout already pads to; Uint10 is always 10-10-10-2 normalised, as
+	/// stock Metal's UInt1010102Normalized.
+	static GPU::VertexFormat toVertexFormat(uint8_t _num, AttribType::Enum _type, bool _normalized, bool _asInt, bool _integerInput)
 	{
-		// asInt is ignored, as renderer_mtl.cpp's s_attribType ignores it: bgfx's
-		// meshes pack normals as Uint8 normalized asInt, and the shader unpacks.
 		BX_UNUSED(_asInt);
+
+		const bool integer = _integerInput;
+
+		if (!_normalized
+		&&  !integer
+		&&  (AttribType::Uint8 == _type || AttribType::Int16 == _type) )
+		{
+			traceOnce(Unsupported::VertexFormat, "G7: a non-normalised Uint8 or Int16 attribute feeding a float shader input is read normalised (0..1), where stock Metal reads 0..255; the integer format is for integer inputs only.");
+		}
 
 		switch (_type)
 		{
 		case AttribType::Uint8:
-			if (!_normalized)
+			switch (_num)
 			{
-				traceOnce(Unsupported::VertexFormat, "G7: a non-normalised Uint8 attribute is given UByte4Norm; a float input reads it scaled to 0..1, an integer input (uvec4) fails the pipeline and its draws are skipped.");
+			case 1:  return integer ? GPU::VertexFormat::UByte  : GPU::VertexFormat::UByteNorm;
+			case 2:  return integer ? GPU::VertexFormat::UByte2 : GPU::VertexFormat::UByte2Norm;
+			default: return integer ? GPU::VertexFormat::UByte4 : GPU::VertexFormat::UByte4Norm;
 			}
-			return GPU::VertexFormat::UByte4Norm;
 
 		case AttribType::Uint10:
-			traceOnce(Unsupported::VertexFormat, "G7: a Uint10 attribute is given UByte4Norm, which reads the wrong bits.");
-			return GPU::VertexFormat::UByte4Norm;
+			if (integer)
+			{
+				traceOnce(Unsupported::VertexFormat, "G7: a Uint10 attribute feeding an integer shader input has no integer format; it is read as 10-10-10-2 normalised and the pipeline fails.");
+			}
+			return GPU::VertexFormat::UInt1010102Norm;
 
 		case AttribType::Int16:
-			if (!_normalized)
+			switch (_num)
 			{
-				traceOnce(Unsupported::VertexFormat, "G7: a non-normalised Int16 attribute is given ShortNorm; a float input reads it scaled to -1..1, an integer input fails the pipeline and its draws are skipped.");
+			case 1:  return integer ? GPU::VertexFormat::Short  : GPU::VertexFormat::ShortNorm;
+			case 2:  return integer ? GPU::VertexFormat::Short2 : GPU::VertexFormat::Short2Norm;
+			default: return integer ? GPU::VertexFormat::Short4 : GPU::VertexFormat::Short4Norm;
 			}
-			return _num <= 2 ? GPU::VertexFormat::Short2Norm : GPU::VertexFormat::Short4Norm;
 
 		case AttribType::Half:
-			return _num <= 2 ? GPU::VertexFormat::Half2 : GPU::VertexFormat::Half4;
+			switch (_num)
+			{
+			case 1:  return GPU::VertexFormat::Half;
+			case 2:  return GPU::VertexFormat::Half2;
+			default: return GPU::VertexFormat::Half4;
+			}
 
 		case AttribType::Float:
 		default:
@@ -808,8 +833,9 @@ namespace bgfx { namespace eacp
 			Unknown,
 		};
 
-		Enum    m_kind  = Unknown;
-		uint8_t m_index = 0; // Attrib::Enum or the i_dataN number
+		Enum    m_kind    = Unknown;
+		uint8_t m_index   = 0;     // Attrib::Enum or the i_dataN number
+		bool    m_integer = false; // declared uint or int (G7)
 	};
 
 	static constexpr uint32_t kMaxAttributes = 31;
@@ -873,6 +899,36 @@ namespace bgfx { namespace eacp
 				;
 		}
 
+		/// Whether the type before the name at _nameBegin is an integer one:
+		/// SPIRV-Cross declares a uvec4 input `uint4 a_indices`, an ivec4 one
+		/// `int4`.
+		static bool isIntegerType(const std::string& _msl, size_t _nameBegin)
+		{
+			size_t typeEnd = _nameBegin;
+			while (typeEnd > 0 && ' ' == _msl[typeEnd-1])
+			{
+				--typeEnd;
+			}
+
+			size_t typeBegin = typeEnd;
+			while (typeBegin > 0 && bx::isAlphaNum(_msl[typeBegin-1]) )
+			{
+				--typeBegin;
+			}
+
+			const std::string type = _msl.substr(typeBegin, typeEnd-typeBegin);
+
+			for (const char* prefix : { "uint", "int", "ushort", "short", "uchar", "char" })
+			{
+				if (0 == type.rfind(prefix, 0) )
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
 		/// The vertex inputs as the MSL declares them: `<type> <name>
 		/// [[attribute(<n>)]];` in xlatMtlMain_in. The binary's attribute list says
 		/// the same for vertex attributes, but names every i_dataN 0xffff.
@@ -909,7 +965,8 @@ namespace bgfx { namespace eacp
 
 				const std::string name = _msl.substr(nameBegin, nameEnd-nameBegin);
 				AttributeSource& source = m_attributes[location];
-				source.m_kind = AttributeSource::Unknown;
+				source.m_kind    = AttributeSource::Unknown;
+				source.m_integer = isIntegerType(_msl, nameBegin);
 
 				for (uint8_t ii = 0; ii < Attrib::Count; ++ii)
 				{
@@ -1777,6 +1834,21 @@ namespace bgfx { namespace eacp
 		int64_t     m_offset = -1;
 	};
 
+	/// bgfx's occlusion queries (G10), as renderer_mtl.cpp's
+	/// OcclusionQueryMTL: a query's result at its handle's index, in one
+	/// eacp set per frame in flight, since a set is one buffer and frame
+	/// N+1 writes the indices frame N's answers are read from. Each set
+	/// lists the handles its frame counted, read into Frame::m_occlusion
+	/// once the frame is done (resolveOcclusion); until then bgfx's value
+	/// stays, NoResult for a new query.
+	struct OcclusionSet
+	{
+		std::optional<GPU::OcclusionQueries> m_queries;
+		uint16_t m_pending[BGFX_CONFIG_MAX_OCCLUSION_QUERIES];
+		uint16_t m_numPending = 0;
+		uint64_t m_listed[(BGFX_CONFIG_MAX_OCCLUSION_QUERIES+63)/64] = {};
+	};
+
 	struct RendererContextEacp : public RendererContextI
 	{
 		RendererContextEacp()
@@ -1883,7 +1955,17 @@ namespace bgfx { namespace eacp
 				// each primitive's with gl_Layer, which eacp-metal compiles to
 				// [[render_target_array_index]].
 				| (device.supportsLayeredRendering() ? BGFX_CAPS_VIEWPORT_LAYER_ARRAY : 0)
+				// Uint10 attributes read as 10-10-10-2 normalised (G7).
+				| BGFX_CAPS_VERTEX_ATTRIB_UINT10
 				;
+
+			// bgfx has no caps bit for occlusion queries (every renderer has
+			// them); without eacp's, a query never answers (NoResult) and a
+			// draw conditional on it is drawn.
+			if (!createOcclusionSets(device) )
+			{
+				traceOnce(Unsupported::OcclusionQuery, "G10: the device has no occlusion queries; they answer NoResult.");
+			}
 
 			fillFormatCaps(device);
 			m_vertexTextures = device.supportsVertexTextures();
@@ -2664,9 +2746,160 @@ namespace bgfx { namespace eacp
 			bx::free(g_allocator, data);
 		}
 
-		void invalidateOcclusionQuery(OcclusionQueryHandle /*_handle*/) override
+		/// A query the app destroyed is read no more, as
+		/// OcclusionQueryMTL::invalidate.
+		void invalidateOcclusionQuery(OcclusionQueryHandle _handle) override
 		{
+			for (OcclusionSet& set : m_occlusionSets)
+			{
+				for (uint16_t ii = 0; ii < set.m_numPending; ++ii)
+				{
+					if (set.m_pending[ii] == _handle.idx)
+					{
+						set.m_pending[ii] = kInvalidHandle;
+					}
+				}
+
+				set.m_listed[_handle.idx/64] &= ~(UINT64_C(1) << (_handle.idx%64) );
+			}
 		}
+
+		bool createOcclusionSets(GPU::Device& _device)
+		{
+			if (!_device.supportsOcclusionQueries() )
+			{
+				return false;
+			}
+
+			for (OcclusionSet& set : m_occlusionSets)
+			{
+				set.m_queries.emplace(_device, int(BGFX_CONFIG_MAX_OCCLUSION_QUERIES) );
+
+				if (!set.m_queries->isValid() )
+				{
+					for (OcclusionSet& made : m_occlusionSets)
+					{
+						made.m_queries.reset();
+					}
+
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		/// The set this frame's passes count into, or NULL without queries.
+		GPU::OcclusionQueries* occlusionSet()
+		{
+			std::optional<GPU::OcclusionQueries>& queries = m_occlusionSets[m_occlusionFrame % kNumOcclusionSets].m_queries;
+			return queries ? &*queries : NULL;
+		}
+
+		/// Copies one set's counted queries into _render->m_occlusion.
+		void readOcclusionSet(Frame* _render, OcclusionSet& _set)
+		{
+			if (0 == _set.m_numPending)
+			{
+				return;
+			}
+
+			uint64_t results[BGFX_CONFIG_MAX_OCCLUSION_QUERIES];
+			_set.m_queries->read(results);
+
+			for (uint16_t ii = 0; ii < _set.m_numPending; ++ii)
+			{
+				const uint16_t idx = _set.m_pending[ii];
+
+				if (kInvalidHandle != idx)
+				{
+					_render->m_occlusion[idx] = int32_t(bx::min<uint64_t>(results[idx], INT32_MAX) );
+				}
+			}
+
+			_set.m_numPending = 0;
+			bx::memSet(_set.m_listed, 0, sizeof(_set.m_listed) );
+		}
+
+		/// At the start of a frame: the answers of every earlier frame the GPU
+		/// has finished, oldest first so a newer count wins, and always those
+		/// of the frame whose set this one reuses (read waits for it, which
+		/// the frames-in-flight pacing has already done). A frame still
+		/// running keeps bgfx's last value, as stock Metal's does.
+		void resolveOcclusion(Frame* _render)
+		{
+			if (NULL == occlusionSet() )
+			{
+				return;
+			}
+
+			for (uint32_t age = kNumOcclusionSets; age >= 1; --age)
+			{
+				if (m_occlusionFrame < age)
+				{
+					continue;
+				}
+
+				OcclusionSet& set = m_occlusionSets[(m_occlusionFrame - age) % kNumOcclusionSets];
+
+				if (kNumOcclusionSets != age
+				&&  !set.m_queries->isComplete() )
+				{
+					break;
+				}
+
+				readOcclusionSet(_render, set);
+			}
+		}
+
+		/// Opens bgfx's query _handle around the draw that follows, in
+		/// AnySamples mode as stock Metal's Boolean visibility: the count bgfx
+		/// reports is then 1 for any pixel passing, like stock's. An index the
+		/// open pass already counted (two views sharing a pass) is not counted
+		/// again; the first count stands.
+		bool beginOcclusionQuery(GPU::RenderPass& _pass, OcclusionQueryHandle _handle)
+		{
+			if (NULL == occlusionSet() )
+			{
+				return false;
+			}
+
+			const uint64_t bit = UINT64_C(1) << (_handle.idx%64);
+
+			if (0 != (m_occlusionInPass[_handle.idx/64] & bit) )
+			{
+				traceOnce(Unsupported::OcclusionQuery, "G10: an occlusion query drawn twice in one pass counts its first draw only.");
+				return false;
+			}
+
+			m_occlusionInPass[_handle.idx/64] |= bit;
+
+			OcclusionSet& set = m_occlusionSets[m_occlusionFrame % kNumOcclusionSets];
+
+			if (0 == (set.m_listed[_handle.idx/64] & bit) )
+			{
+				set.m_listed[_handle.idx/64] |= bit;
+				set.m_pending[set.m_numPending++] = _handle.idx;
+			}
+
+			_pass.beginOcclusionQuery(int(_handle.idx), GPU::OcclusionMode::AnySamples);
+			return true;
+		}
+
+		/// The query beginOcclusionQuery opened, closed as the loop's draw
+		/// iteration ends however it ends.
+		struct OcclusionScope
+		{
+			~OcclusionScope()
+			{
+				if (NULL != m_pass)
+				{
+					m_pass->endOcclusionQuery();
+				}
+			}
+
+			GPU::RenderPass* m_pass = NULL;
+		};
 
 		void setMarker(const char* /*_marker*/, uint16_t /*_len*/) override
 		{
@@ -3457,9 +3690,42 @@ namespace bgfx { namespace eacp
 			return NULL == m_view || m_view->hasStencil();
 		}
 
-		int windowSampleCount() const
+		/// The drawable's sample count: the view's, 1 headless.
+		int drawableSampleCount() const
 		{
 			return NULL == m_view ? 1 : m_view->sampleCount();
+		}
+
+		/// What the window's passes render at: the window target's when
+		/// they render into it (updateWindowScale), else the drawable's.
+		int windowSampleCount() const
+		{
+			return m_windowProxied && m_windowProxy
+				? m_windowProxy->sampleCount()
+				: drawableSampleCount()
+				;
+		}
+
+		/// The window target's sample count: the swap chain's MSAA, at the
+		/// highest count the device takes up to it (as renderer_mtl.cpp's
+		/// table), resolved into the target at the end of each pass and
+		/// drawn onto the drawable from there; without MSAA the drawable's.
+		int proxySampleCount() const
+		{
+			if (0 == m_windowMsaa)
+			{
+				return drawableSampleCount();
+			}
+
+			int count = 1 << bx::min<uint32_t>(m_windowMsaa, 4);
+
+			while (1 < count
+			&&     !GPU::Device::shared().supportsSampleCount(count) )
+			{
+				count >>= 1;
+			}
+
+			return count;
 		}
 
 		/// What the open pass renders into, which a pipeline has to agree with:
@@ -3561,7 +3827,7 @@ namespace bgfx { namespace eacp
 							bool asInt;
 							layout.decode(attr, num, type, normalized, asInt);
 
-							format      = toVertexFormat(num, type, normalized, asInt);
+							format      = toVertexFormat(num, type, normalized, asInt, source.m_integer);
 							offset      = layout.m_offset[attr];
 							bufferIndex = stream;
 							found       = true;
@@ -3592,6 +3858,11 @@ namespace bgfx { namespace eacp
 					// (BufferEacp::byteFallback), and without a stream from
 					// zeros stepped per instance.
 					BX_TRACE("eacp: attribute(%d) is not in the draw's streams; it reads stream 0's first bytes.", location);
+
+					if (source.m_integer)
+					{
+						traceOnce(Unsupported::VertexFormat, "G7: an integer shader input no stream carries reads the Float2 byte fallback, which an integer input refuses; the pipeline fails and its draws are skipped.");
+					}
 
 					_fallbackSlot   = uint8_t(_numStreams + (0 < _numInstanceData ? 1 : 0) );
 					format      = 0 < _numStreams ? GPU::VertexFormat::Float2 : GPU::VertexFormat::UByte4Norm;
@@ -4013,10 +4284,7 @@ namespace bgfx { namespace eacp
 
 			_render->sort();
 
-			if (0 != (_render->m_mainSwapChain.flags & BGFX_SWAP_CHAIN_MSAA_MASK) )
-			{
-				traceOnce(Unsupported::Msaa, "MSAA asked of the window is ignored: BgfxView renders at sample count 1.");
-			}
+			m_windowMsaa = (_render->m_mainSwapChain.flags & BGFX_SWAP_CHAIN_MSAA_MASK) >> BGFX_SWAP_CHAIN_MSAA_SHIFT;
 
 			if (0 != (m_reset & BGFX_RESET_CAPTURE) )
 			{
@@ -4034,6 +4302,8 @@ namespace bgfx { namespace eacp
 			{
 				updateWindowScale(*s_frame, _render->m_mainSwapChain);
 			}
+
+			resolveOcclusion(_render);
 
 			if (NULL != s_frame
 			&&  0 == (_render->m_debug & BGFX_DEBUG_IFH) )
@@ -4053,6 +4323,11 @@ namespace bgfx { namespace eacp
 			endPass();
 			m_lastPipelineKey = 0;
 			m_lastPipeline    = NULL;
+
+			if (NULL != s_frame)
+			{
+				++m_occlusionFrame;
+			}
 
 			Stats& perfStats = _render->m_perfStats;
 			perfStats.cpuTimeBegin  = timeBegin;
@@ -4212,7 +4487,7 @@ namespace bgfx { namespace eacp
 				if (!m_windowProxy
 				||  m_windowProxy->width()       != int(m_backbufferWidth)
 				||  m_windowProxy->height()      != int(m_backbufferHeight)
-				||  m_windowProxy->sampleCount() != windowSampleCount()
+				||  m_windowProxy->sampleCount() != proxySampleCount()
 				||  m_windowProxy->hasDepth()    != windowHasDepth()
 				||  m_windowProxy->hasStencil()  != windowHasStencil() )
 				{
@@ -4221,7 +4496,7 @@ namespace bgfx { namespace eacp
 					desc.height       = int(m_backbufferHeight);
 					desc.format       = GPU::TextureFormat::BGRA8Unorm;
 					desc.renderTarget = true;
-					desc.sampleCount  = windowSampleCount();
+					desc.sampleCount  = proxySampleCount();
 					desc.depth        = windowHasDepth() || windowHasStencil();
 					desc.stencil      = windowHasStencil();
 					m_windowProxy.emplace(GPU::Device::shared().makeTexture(desc, NULL) );
@@ -4240,6 +4515,13 @@ namespace bgfx { namespace eacp
 					m_windowScaleY  = 1.0f;
 				}
 			}
+
+			if (!m_windowProxied
+			&&  0 != m_windowMsaa
+			&&  proxySampleCount() != drawableSampleCount() )
+			{
+				traceOnce(Unsupported::Msaa, "MSAA asked of the window is ignored on a drawable rendered directly (BGFX_RESET_HIDPI): BgfxView's sample count stands.");
+			}
 		}
 
 		/// The fullscreen triangle presentWindowProxy draws the window's
@@ -4248,7 +4530,7 @@ namespace bgfx { namespace eacp
 		/// depth-stencil format and MSAA bgfx's reset asked for (G100).
 		bool makeUpscalePipeline()
 		{
-			const int key = windowSampleCount()*4 + (windowHasDepth() ? 2 : 0) + (windowHasStencil() ? 1 : 0);
+			const int key = drawableSampleCount()*4 + (windowHasDepth() ? 2 : 0) + (windowHasStencil() ? 1 : 0);
 
 			m_upscalePipeline = &m_upscalePipelines[key];
 
@@ -4286,7 +4568,7 @@ namespace bgfx { namespace eacp
 			GPU::RenderPipelineDescriptor desc;
 			desc.library      = &*m_upscaleLibrary;
 			desc.colorFormat  = GPU::PixelFormat::BGRA8Unorm;
-			desc.sampleCount  = windowSampleCount();
+			desc.sampleCount  = drawableSampleCount();
 			desc.depth        = windowHasDepth();
 			desc.depthCompare = GPU::CompareFunction::Always;
 			desc.depthWrite   = false;
@@ -4376,6 +4658,8 @@ namespace bgfx { namespace eacp
 
 			m_computePass.reset();
 			m_pass.reset();
+			_descriptor.occlusionQueries = occlusionSet();
+			bx::memSet(m_occlusionInPass, 0, sizeof(m_occlusionInPass) );
 			m_pass.emplace(PassMaker{ _frame, _descriptor, m_windowProxied ? &*m_windowProxy : NULL });
 			m_target          = windowTarget();
 			m_passScaleX      = m_windowScaleX;
@@ -4405,6 +4689,8 @@ namespace bgfx { namespace eacp
 
 			m_computePass.reset();
 			m_pass.reset();
+			_descriptor.occlusionQueries = occlusionSet();
+			bx::memSet(m_occlusionInPass, 0, sizeof(m_occlusionInPass) );
 
 			m_pass.emplace(PassMaker{ _frame, _descriptor, &*_texture.m_texture, _targets });
 			m_target            = textureTarget(_texture, _targets.empty() ? NULL : _fb);
@@ -4797,9 +5083,17 @@ namespace bgfx { namespace eacp
 
 				const RenderDraw& draw = renderItem.draw;
 
-				if (isValid(draw.m_occlusionQuery) )
+				// A draw with a query counts it (below); one conditional on a
+				// query (setCondition) is skipped on the CPU when the query's
+				// last answer says so, NoResult counting as visible, as
+				// renderer_mtl.cpp's isVisible.
+				const bool hasOcclusionQuery = 0 != (draw.m_stateFlags & BGFX_STATE_INTERNAL_OCCLUSION_QUERY);
+
+				if (isValid(draw.m_occlusionQuery)
+				&&  !hasOcclusionQuery
+				&&  (0 != (draw.m_submitFlags&BGFX_SUBMIT_INTERNAL_OCCLUSION_VISIBLE) ) != (0 != _render->m_occlusion[draw.m_occlusionQuery.idx]) )
 				{
-					traceOnce(Unsupported::OcclusionQuery, "G10: an occlusion query never answers, and a draw conditional on one is drawn.");
+					continue;
 				}
 
 				if (_render->m_frameCache.isZeroArea(viewScissorRect, draw.m_scissor) )
@@ -5016,6 +5310,15 @@ namespace bgfx { namespace eacp
 				if (program->usesStorage() )
 				{
 					bindRenderStorage(pass, renderBind);
+				}
+
+				OcclusionScope occlusionScope;
+
+				if (hasOcclusionQuery
+				&&  isValid(draw.m_occlusionQuery)
+				&&  beginOcclusionQuery(pass, draw.m_occlusionQuery) )
+				{
+					occlusionScope.m_pass = &pass;
 				}
 
 				if (isValid(draw.m_indirectBuffer) )
@@ -5650,6 +5953,12 @@ namespace bgfx { namespace eacp
 		GPU::StreamingBuffers m_vertexStream;
 		GPU::StreamingBuffers m_indexStream;
 
+		static constexpr uint32_t kNumOcclusionSets = GPU::StreamingBuffers::framesInFlight;
+
+		OcclusionSet m_occlusionSets[kNumOcclusionSets];
+		uint64_t     m_occlusionFrame = 0;                                          // submits so far; set m_occlusionFrame % kNumOcclusionSets is this frame's
+		uint64_t     m_occlusionInPass[(BGFX_CONFIG_MAX_OCCLUSION_QUERIES+63)/64] = {}; // indices the open pass has counted, each once per pass
+
 		std::optional<GPU::RenderPass> m_pass;
 		std::optional<GPU::ComputePass> m_computePass; // the open run of compute items, one view's
 		Target   m_target;
@@ -5660,6 +5969,7 @@ namespace bgfx { namespace eacp
 		uint16_t m_passDepth       = kInvalidHandle; // the depth texture whose own plane the open pass attaches (depthTarget)
 		uint16_t m_genFrameBuffer  = kInvalidHandle; // the framebuffer the last texture view drew into, whose mips are built when its views end
 		bool     m_windowDepthKept = false;          // a window pass this frame kept the depth plane
+		uint32_t m_windowMsaa      = 0;              // the main swap chain's BGFX_SWAP_CHAIN_MSAA_* index
 		bool     m_needFlush       = false;          // passes recorded since the last Frame::flush
 		float    m_passScaleX       = 1.0f;           // the open pass's target pixels per bgfx unit
 		float    m_passScaleY       = 1.0f;
