@@ -309,9 +309,14 @@ namespace bgfx { namespace eacp
 			{
 				// Zeroed rather than uninitialised: a kernel that accumulates
 				// into it, or an indirect buffer read before it is written, sees
-				// what a fresh buffer on every other bgfx backend holds.
-				const std::vector<uint8_t> zero(bytes, 0);
-				m_static.emplace(GPU::Device::shared().makeBuffer(zero.data(), bytes, usage() ) );
+				// what a fresh buffer on every other bgfx backend holds. And
+				// with as many zero bytes again past its end (up to 1 MiB): a
+				// kernel reading past the end (37-gpudrivenrendering's stream
+				// compaction reads its predicates up to twice the instance
+				// count's power of two) finds zeros, as it happens to on the
+				// stock backends, rather than a neighbouring allocation (G95).
+				const std::vector<uint8_t> zero(bytes + bx::min<uint32_t>(bytes, 1<<20), 0);
+				m_static.emplace(GPU::Device::shared().makeBuffer(zero.data(), int64_t(zero.size() ), usage() ) );
 			}
 			else
 			{
@@ -3900,6 +3905,7 @@ namespace bgfx { namespace eacp
 			if (NULL != s_frame)
 			{
 				submitDebugText(*s_frame, _render, _textVideoMemBlitter, timeEnd, frameTime, statsKeyType, statsNumPrimsRendered);
+				presentWindowProxy(*s_frame);
 			}
 
 			endPass();
@@ -4041,6 +4047,142 @@ namespace bgfx { namespace eacp
 			m_backbufferHeight = uint16_t(bx::max<uint32_t>(_swapChain.height, 1) );
 			m_windowScaleX     = 0.0f < size.x ? float(size.x)/float(m_backbufferWidth)  : 1.0f;
 			m_windowScaleY     = 0.0f < size.y ? float(size.y)/float(m_backbufferHeight) : 1.0f;
+			m_windowProxied    = false;
+
+			// Without BGFX_RESET_HIDPI bgfx's backbuffer is the window's size
+			// in points, and the stock backends render it at that size (a
+			// layer of contentsScale 1 the compositor scales up), so whatever
+			// counts pixels, gl_FragCoord and bgfx's debug text above all, sees
+			// one pixel per point. eacp's drawable is always at the backing
+			// scale, so the window's passes render into a target of the
+			// backbuffer's size and that is drawn onto the drawable at the end
+			// of the frame (presentWindowProxy), nearest at a whole scale,
+			// linear otherwise (G92).
+			if (!s_hiDpi
+			&&  (1.0f != m_windowScaleX || 1.0f != m_windowScaleY)
+			&&  0.0f < size.x
+			&&  0.0f < size.y)
+			{
+				if (!m_windowProxy
+				||  m_windowProxy->width()       != int(m_backbufferWidth)
+				||  m_windowProxy->height()      != int(m_backbufferHeight)
+				||  m_windowProxy->sampleCount() != windowSampleCount()
+				||  m_windowProxy->hasDepth()    != windowHasDepth()
+				||  m_windowProxy->hasStencil()  != windowHasStencil() )
+				{
+					GPU::TextureDescriptor desc;
+					desc.width        = int(m_backbufferWidth);
+					desc.height       = int(m_backbufferHeight);
+					desc.format       = GPU::TextureFormat::BGRA8Unorm;
+					desc.renderTarget = true;
+					desc.sampleCount  = windowSampleCount();
+					desc.depth        = windowHasDepth() || windowHasStencil();
+					desc.stencil      = windowHasStencil();
+					m_windowProxy.emplace(GPU::Device::shared().makeTexture(desc, NULL) );
+
+					if (!m_windowProxy->isValid() )
+					{
+						m_windowProxy.reset();
+					}
+				}
+
+				if (m_windowProxy
+				&&  makeUpscalePipeline() )
+				{
+					m_windowProxied = true;
+					m_windowScaleX  = 1.0f;
+					m_windowScaleY  = 1.0f;
+				}
+			}
+		}
+
+		/// The fullscreen triangle presentWindowProxy draws the window's
+		/// target onto the drawable with.
+		bool makeUpscalePipeline()
+		{
+			// Remade when the drawable's sample count or planes change.
+			const int key = windowSampleCount()*4 + (windowHasDepth() ? 2 : 0) + (windowHasStencil() ? 1 : 0);
+
+			if (m_upscalePipeline
+			&&  key == m_upscaleKey)
+			{
+				return m_upscalePipeline->isValid();
+			}
+
+			m_upscaleKey = key;
+
+			static const char* s_upscale =
+				"#include <metal_stdlib>\n"
+				"using namespace metal;\n"
+				"struct UpscaleOut { float4 position [[position]]; float2 uv; };\n"
+				"vertex UpscaleOut upscaleVertex(uint vid [[vertex_id]])\n"
+				"{\n"
+				"    const float2 corner = float2(float((vid << 1) & 2), float(vid & 2));\n"
+				"    UpscaleOut out;\n"
+				"    out.position = float4(corner*2.0 - 1.0, 0.0, 1.0);\n"
+				"    out.uv       = float2(corner.x, 1.0 - corner.y);\n"
+				"    return out;\n"
+				"}\n"
+				"fragment float4 upscaleFragment(UpscaleOut in [[stage_in]], texture2d<float> source [[texture(0)]], sampler filter [[sampler(0)]])\n"
+				"{\n"
+				"    return source.sample(filter, in.uv);\n"
+				"}\n"
+				;
+
+			GPU::ShaderSource source = GPU::ShaderSource::msl(s_upscale);
+			source.withVertex("upscaleVertex");
+			source.withFragment("upscaleFragment");
+			m_upscaleLibrary.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+
+			GPU::RenderPipelineDescriptor desc;
+			desc.library      = &*m_upscaleLibrary;
+			desc.colorFormat  = GPU::PixelFormat::BGRA8Unorm;
+			desc.sampleCount  = windowSampleCount();
+			desc.depth        = windowHasDepth();
+			desc.depthCompare = GPU::CompareFunction::Always;
+			desc.depthWrite   = false;
+			desc.stencil      = windowHasStencil();
+			desc.cullMode     = GPU::CullMode::None;
+			m_upscalePipeline.emplace(GPU::Device::shared().makeRenderPipeline(desc) );
+
+			if (!m_upscalePipeline->isValid() )
+			{
+				BX_TRACE("eacp: the window upscale pipeline does not build; the window renders at the drawable's size.");
+			}
+
+			return m_upscalePipeline->isValid();
+		}
+
+		/// The window's target of the backbuffer's size drawn onto the
+		/// drawable (updateWindowScale).
+		void presentWindowProxy(GPU::Frame& _frame)
+		{
+			if (!m_windowProxied)
+			{
+				return;
+			}
+
+			endPass();
+
+			const ::eacp::Graphics::Point size = _frame.pixelSize();
+			const bool whole = true
+				&& float(int(size.x/float(m_backbufferWidth) ) )*float(m_backbufferWidth)  == size.x
+				&& float(int(size.y/float(m_backbufferHeight) ) )*float(m_backbufferHeight) == size.y
+				;
+
+			GPU::RenderPassDescriptor descriptor;
+			descriptor.label = "window";
+			descriptor.clear = false;
+			descriptor.depthAction = GPU::DepthAction::Keep;
+
+			m_pass.emplace(PassMaker{ _frame, descriptor, NULL });
+			m_pass->setViewport({ 0.0f, 0.0f, float(size.x), float(size.y) }, 0.0f, 1.0f);
+			m_pass->setScissorRect({ 0.0f, 0.0f, float(size.x), float(size.y) });
+			m_pass->setPipeline(*m_upscalePipeline);
+			m_pass->setFragmentTexture(*m_windowProxy, 0, getSampler(whole ? BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP : BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
+			m_pass->draw(3);
+			m_needFlush = true;
+			endPass();
 		}
 
 		/// A rect of the open pass's target from bgfx's units into the
@@ -4079,7 +4221,7 @@ namespace bgfx { namespace eacp
 
 			m_computePass.reset();
 			m_pass.reset();
-			m_pass.emplace(PassMaker{ _frame, _descriptor, NULL });
+			m_pass.emplace(PassMaker{ _frame, _descriptor, m_windowProxied ? &*m_windowProxy : NULL });
 			m_target          = windowTarget();
 			m_passScaleX      = m_windowScaleX;
 			m_passScaleY      = m_windowScaleY;
@@ -5255,7 +5397,10 @@ namespace bgfx { namespace eacp
 			// The text is laid out on bgfx's backbuffer, which covers the whole
 			// drawable (updateWindowScale).
 			GPU::RenderPass& pass = *m_pass;
-			const ::eacp::Graphics::Point size = s_frame->pixelSize();
+			const ::eacp::Graphics::Point size = m_windowProxied
+				? ::eacp::Graphics::Point{ float(m_backbufferWidth), float(m_backbufferHeight) }
+				: s_frame->pixelSize()
+				;
 			const float width  = float(m_backbufferWidth);
 			const float height = float(m_backbufferHeight);
 
@@ -5347,6 +5492,11 @@ namespace bgfx { namespace eacp
 		bool     m_needFlush       = false;          // passes recorded since the last Frame::flush
 		float    m_passScaleX       = 1.0f;           // the open pass's target pixels per bgfx unit
 		float    m_passScaleY       = 1.0f;
+		std::optional<GPU::Texture>        m_windowProxy;     // the window's passes' target without BGFX_RESET_HIDPI on a scaled drawable (updateWindowScale)
+		std::optional<GPU::ShaderLibrary>  m_upscaleLibrary;  // ... drawn onto the drawable through these
+		std::optional<GPU::RenderPipeline> m_upscalePipeline;
+		int      m_upscaleKey       = 0;
+		bool     m_windowProxied    = false;          // this frame's window passes go into m_windowProxy
 		float    m_windowScaleX     = 1.0f;           // drawable pixels per backbuffer unit
 		float    m_windowScaleY     = 1.0f;
 		uint16_t m_backbufferWidth  = 1;              // the main swap chain, in the entry layer's units
