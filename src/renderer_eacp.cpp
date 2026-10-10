@@ -74,6 +74,8 @@ namespace bgfx { namespace eacp
 			BlitShadow,         // G32
 			Indirect,           // G8
 			Msaa,               // window is sample count 1
+			Capture,            // G34
+			OcclusionQuery,     // G10
 			BlendFactor,        // G26
 			DepthBias,          // G27
 			Wireframe,          // G28
@@ -1012,6 +1014,25 @@ namespace bgfx { namespace eacp
 		return false;
 	}
 
+	/// The sample count of a BGFX_TEXTURE_RT_MSAA_* render target: the count
+	/// asked for, or the highest below it the device multisamples at, as
+	/// renderer_mtl.cpp's choice from its sample count table. eacp refuses a
+	/// count the device cannot take rather than clamping it.
+	static int sampleCountFor(uint64_t _flags)
+	{
+		const uint32_t msaa = uint32_t( (_flags&BGFX_TEXTURE_RT_MSAA_MASK)>>BGFX_TEXTURE_RT_MSAA_SHIFT);
+
+		int count = 1 < msaa ? int(1 << bx::min<uint32_t>(msaa-1, 4) ) : 1;
+
+		while (1 < count
+		&&     !GPU::Device::shared().supportsSampleCount(count) )
+		{
+			count >>= 1;
+		}
+
+		return count;
+	}
+
 	static uint32_t mipExtent(uint32_t _extent, uint8_t _mip)
 	{
 		return bx::max<uint32_t>(1, _extent >> _mip);
@@ -1179,14 +1200,12 @@ namespace bgfx { namespace eacp
 				m_stencilFormat = 0 < bimg::getBlockInfo(bimg::TextureFormat::Enum(m_textureFormat) ).stencilBits;
 				m_numMips       = 1;
 
-				const uint32_t msaa = uint32_t( (_flags&BGFX_TEXTURE_RT_MSAA_MASK)>>BGFX_TEXTURE_RT_MSAA_SHIFT);
-
 				m_desc = GPU::TextureDescriptor();
 				m_desc.width        = int(m_width);
 				m_desc.height       = int(m_height);
 				m_desc.format       = GPU::TextureFormat::RGBA8Unorm;
 				m_desc.renderTarget = true;
-				m_desc.sampleCount  = 1 < msaa ? int(1 << bx::min<uint32_t>(msaa-1, 3) ) : 1;
+				m_desc.sampleCount  = sampleCountFor(_flags);
 				return;
 			}
 
@@ -1230,8 +1249,7 @@ namespace bgfx { namespace eacp
 
 			if (desc.renderTarget)
 			{
-				const uint32_t msaa = uint32_t( (_flags&BGFX_TEXTURE_RT_MSAA_MASK)>>BGFX_TEXTURE_RT_MSAA_SHIFT);
-				desc.sampleCount = 1 < msaa ? int(1 << bx::min<uint32_t>(msaa-1, 3) ) : 1;
+				desc.sampleCount = sampleCountFor(_flags);
 			}
 
 			const bool compressed = GPU::isCompressedFormat(m_format);
@@ -1763,12 +1781,17 @@ namespace bgfx { namespace eacp
 			const uint32_t renderable = 0
 				| BGFX_CAPS_FORMAT_TEXTURE_2D
 				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER
+				| BGFX_CAPS_FORMAT_TEXTURE_MSAA
+				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER_MSAA
 				;
 
 			// What toEacpFormat maps: 2D and cube (eacp's two dimensionalities),
 			// renderable where eacp renders to it. No _SRGB (G4), no 3D (G15),
 			// no _VERTEX (G17), no _MIP_AUTOGEN (G6), _IMAGE_* only where eacp
-			// makes a compute-write texture (G14), no _MSAA. bgfx adds _EMULATED to every other format bimg can
+			// makes a compute-write texture (G14). _MSAA and _FRAMEBUFFER_MSAA
+			// on what renders, depth included: eacp multisamples a render target
+			// and resolves it (sampleCountFor picks the count the device takes).
+			// bgfx adds _EMULATED to every other format bimg can
 			// decode to BGRA8, and createTexture does that decode.
 			const uint32_t sampled = 0
 				| BGFX_CAPS_FORMAT_TEXTURE_2D
@@ -1811,6 +1834,8 @@ namespace bgfx { namespace eacp
 			const uint32_t depth = 0
 				| BGFX_CAPS_FORMAT_TEXTURE_2D
 				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER
+				| BGFX_CAPS_FORMAT_TEXTURE_MSAA
+				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER_MSAA
 				;
 
 			g_caps.formats[TextureFormat::D16  ] = depth;
@@ -3486,6 +3511,11 @@ namespace bgfx { namespace eacp
 				traceOnce(Unsupported::Msaa, "MSAA asked of the window is ignored: BgfxView renders at sample count 1.");
 			}
 
+			if (0 != (m_reset & BGFX_RESET_CAPTURE) )
+			{
+				traceOnce(Unsupported::Capture, "G34: BGFX_RESET_CAPTURE calls no captureBegin or captureFrame (no read of the drawable inside a frame).");
+			}
+
 			if (0 != (_render->m_debug & BGFX_DEBUG_WIREFRAME) )
 			{
 				traceOnce(Unsupported::Wireframe, "G28: BGFX_DEBUG_WIREFRAME has no eacp fill mode.");
@@ -4039,6 +4069,11 @@ namespace bgfx { namespace eacp
 				}
 
 				const RenderDraw& draw = renderItem.draw;
+
+				if (isValid(draw.m_occlusionQuery) )
+				{
+					traceOnce(Unsupported::OcclusionQuery, "G10: an occlusion query never answers, and a draw conditional on one is drawn.");
+				}
 
 				if (_render->m_frameCache.isZeroArea(viewScissorRect, draw.m_scissor) )
 				{
@@ -4657,7 +4692,12 @@ namespace bgfx { namespace eacp
 			{
 				const PredefinedUniform& predefined = program->m_predefined[ii];
 
-				if (PredefinedUniform::ViewProj == (predefined.m_type & ~kUniformFragmentBit) )
+				// vs_debugfont reads u_modelViewProj; renderer_mtl.cpp writes
+				// the ortho into whichever predefined the program has.
+				const uint8_t type = predefined.m_type & ~kUniformFragmentBit;
+
+				if (PredefinedUniform::ViewProj      == type
+				||  PredefinedUniform::ModelViewProj == type)
 				{
 					setShaderUniform(predefined.m_type, predefined.m_loc, proj, 4);
 				}
