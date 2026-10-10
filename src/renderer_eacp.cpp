@@ -41,11 +41,10 @@ namespace bgfx { namespace eacp
 	{
 		enum Enum
 		{
-			CubeRenderTarget,   // G15
 			SamplerKind,
 			SwapChain,          // G16
 			FrameBufferColor,   // attachments eacp's pass refuses together
-			FrameBufferLayer,   // G15
+			FrameBufferLayer,   // layered rendering
 			FrameBufferFormat,  // G4
 			FrameBufferDepth,
 			DepthUnbound,
@@ -54,7 +53,7 @@ namespace bgfx { namespace eacp
 			RenderImage,        // G40
 			VertexTexture,      // G17
 			SamplerSlot,        // G17
-			TextureLayers,      // G15
+			TextureLayers,
 			TextureSrgb,        // G4
 			UnknownFormat,      // G4
 			TargetMipChain,     // G6
@@ -64,14 +63,13 @@ namespace bgfx { namespace eacp
 			TextureExternal,
 			ClearTexture,
 			BorderColor,
-			ComputeImageMip,    // G15
 			ComputeImageFormat, // G14
 			ComputeDepth,       // G39
 			ComputeBind,
 			BlitDepth,          // G36
-			BlitLevel,          // G6, G15
+			BlitLevel,
 			BlitWidened,        // G4
-			BlitVolume,         // G15
+			BlitVolume,
 			Indirect,
 			Msaa,               // window is sample count 1
 			Capture,            // G34
@@ -1149,6 +1147,7 @@ namespace bgfx { namespace eacp
 			, m_stencilFormat(false)
 			, m_depthKept(false)
 			, m_depthOf(kInvalidHandle)
+			, m_depthProxy(kInvalidHandle)
 		{
 		}
 
@@ -1276,28 +1275,31 @@ namespace bgfx { namespace eacp
 				// colour target of this one's own (a depth-only framebuffer).
 				// Sampled through RenderPass::setFragmentDepthTexture on that
 				// target; always a 32-bit float plane, D24S8 and D0S8 with an
-				// 8-bit stencil beside it. One layer: a depth array has no
-				// colour array to carry it until eacp renders to a layer.
-				if (GPU::TextureType::TwoD != m_kind)
+				// 8-bit stencil beside it. A depth array or cube keeps its
+				// kind, which a depth-only framebuffer's carrier takes, so a
+				// pass can attach it at a layer or face (ColorTarget::slice);
+				// beside colour, the colour texture's own depth companion has
+				// its layers. No API has a 3D depth buffer: a depth volume is
+				// one 2D plane.
+				if (GPU::TextureType::ThreeD == m_kind)
 				{
-					traceOnce(Unsupported::TextureLayers, "G15: a depth texture array or cube is created as one 2D plane (no render to a layer yet).");
+					traceOnce(Unsupported::TextureLayers, "a 3D depth texture is created as one 2D plane (no API has a 3D depth buffer).");
+					m_kind = GPU::TextureType::TwoD;
 				}
 
 				m_depthFormat   = true;
 				m_stencilFormat = 0 < bimg::getBlockInfo(bimg::TextureFormat::Enum(m_textureFormat) ).stencilBits;
 				m_numMips       = 1;
-				m_numLayers     = 1;
-				m_numSides      = 1;
 				m_depth         = 1;
-				m_cube          = false;
-				m_kind          = GPU::TextureType::TwoD;
 
 				m_desc = GPU::TextureDescriptor();
 				m_desc.width        = int(m_width);
 				m_desc.height       = int(m_height);
 				m_desc.format       = GPU::TextureFormat::RGBA8Unorm;
+				m_desc.kind         = m_kind;
+				m_desc.arrayLength  = GPU::TextureType::TwoDArray == m_kind || GPU::TextureType::CubeArray == m_kind ? int(m_numLayers) : 1;
 				m_desc.renderTarget = true;
-				m_desc.sampleCount  = sampleCountFor(_flags);
+				m_desc.sampleCount  = GPU::TextureType::TwoD == m_kind ? sampleCountFor(_flags) : 1;
 				return;
 			}
 
@@ -1331,32 +1333,33 @@ namespace bgfx { namespace eacp
 			desc.arrayLength = GPU::TextureType::TwoDArray == m_kind || GPU::TextureType::CubeArray == m_kind ? int(m_numLayers) : 1;
 			desc.volumeDepth = int(m_depth);
 
-			// eacp renders into a 2D target only until a pass can name a layer
-			// or face (ColorTarget::slice, G15's second half); a cube or array
-			// render target is created as a plain one, and a framebuffer
-			// refuses it. A kernel writes a 2D texture, an array or a volume
-			// whole; not a cube, which bgfx's kernels declare as a 2D array
-			// (IMAGE2D_ARRAY) while eacp binds the cube's own cube-typed
-			// texture, a mismatch Metal's validation layer stops on (G66-b).
+			// A render target of any kind: a framebuffer attachment names the
+			// level and the layer, face or volume z a pass renders into
+			// (ColorTarget::level, slice, layerCount). A kernel writes a 2D
+			// texture, an array or a volume at any level; not a cube, which
+			// bgfx's kernels declare as a 2D array (IMAGE2D_ARRAY) while eacp
+			// binds the cube's own cube-typed texture, a mismatch Metal's
+			// validation layer stops on (G66).
 			const bool cubeKind = GPU::TextureType::Cube == m_kind || GPU::TextureType::CubeArray == m_kind;
-			desc.renderTarget = renderTarget && GPU::TextureType::TwoD == m_kind;
+			desc.renderTarget = renderTarget;
 			desc.computeWrite = computeWrite && GPU::supportsComputeWrite(m_format) && !cubeKind;
 
 			if (computeWrite
 			&&  !desc.computeWrite)
 			{
-				traceOnce(Unsupported::ComputeWriteFormat, "G14/G66-b: a compute-write texture eacp cannot write (format, or a cube as a 2D array) is created read-only.");
+				traceOnce(Unsupported::ComputeWriteFormat, "G14/G66: a compute-write texture eacp cannot write (format, or a cube as a 2D array) is created read-only.");
 			}
 
-			if (renderTarget
-			&&  !desc.renderTarget)
-			{
-				traceOnce(Unsupported::CubeRenderTarget, "G15: a cube, array or volume render target is created as a plain texture (no render to a layer yet).");
-			}
-
-			if (desc.renderTarget)
+			if (desc.renderTarget
+			&&  GPU::TextureType::TwoD == m_kind)
 			{
 				desc.sampleCount = sampleCountFor(_flags);
+
+				if (1 < desc.sampleCount)
+				{
+					// A multisampled target has the one level.
+					m_numMips = 1;
+				}
 			}
 
 			const bool gpuWritten = desc.renderTarget || desc.computeWrite;
@@ -1364,10 +1367,10 @@ namespace bgfx { namespace eacp
 			if (gpuWritten
 			&&  1 < m_numMips)
 			{
-				// Nothing fills the levels below 0 of a target yet: no autogen
-				// (G6), no pass or kernel at a level (G15's second half).
-				traceOnce(Unsupported::TargetMipChain, "G6: a render target or compute-written texture has one mip level.");
-				m_numMips = 1;
+				// The levels below 0 are the GPU's to fill, a pass at a level
+				// or a kernel at one; nothing builds them from level 0 (G6),
+				// so a chain bgfx would autogenerate stays as rendered.
+				traceOnce(Unsupported::TargetMipChain, "G6: a render target's or compute-written texture's levels below 0 are filled only by what renders or writes them (no autogen).");
 			}
 
 			// The caller's chain, whatever the kind (a cube's per face).
@@ -1470,6 +1473,7 @@ namespace bgfx { namespace eacp
 			m_stencilFormat = false;
 			m_depthKept     = false;
 			m_depthOf       = kInvalidHandle;
+			m_depthProxy    = kInvalidHandle;
 		}
 
 		/// One box of one level of one slice, through updateSubresource: bgfx's
@@ -1648,6 +1652,7 @@ namespace bgfx { namespace eacp
 		bool m_stencilFormat; // ... with a stencil plane
 		bool m_depthKept;     // the depth plane holds what a pass kept (DepthAction::Resume may load it)
 		uint16_t m_depthOf;   // a depth texture: the texture whose target carries its plane
+		uint16_t m_depthProxy; // ... or the framebuffer whose stand-in for colour 0 does (FrameBufferEacp::m_proxy)
 	};
 
 	/// A bgfx framebuffer of textures: its colour attachments in order, and
@@ -1655,13 +1660,84 @@ namespace bgfx { namespace eacp
 	/// the pass being m_color[n], or for a depth-only framebuffer into the
 	/// depth texture's own carrier target; m_target is the texture whose
 	/// target carries the depth plane (attachment 0, G36).
+	///
+	/// Each attachment names the image it renders into: bgfx's mip is eacp's
+	/// level, its layer the slice (an array layer, a cube face, layer*6 + face
+	/// on a cube array, a volume's z), its numLayers the run of slices a
+	/// layered pass covers (ColorTarget::level, slice, layerCount). m_sub[n]
+	/// is colour attachment n's; m_depthSub the depth attachment's, which is
+	/// what a depth-only framebuffer's carrier renders at.
 	struct FrameBufferEacp
 	{
+		struct Sub
+		{
+			uint8_t  m_level  = 0;
+			uint16_t m_slice  = 0;
+			uint16_t m_layers = 1;
+
+			bool isDefault() const
+			{
+				return 0 == m_level && 0 == m_slice && 1 == m_layers;
+			}
+
+			bool operator==(const Sub& _other) const
+			{
+				return m_level == _other.m_level && m_slice == _other.m_slice && m_layers == _other.m_layers;
+			}
+		};
+
 		uint16_t m_color[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS];
+		Sub      m_sub[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS];
+		Sub      m_depthSub;
+
+		/// A colour attachment rendered through a 2D stand-in of its level's
+		/// size and copied into its image after each pass (and from it before
+		/// a pass that loads): an attachment whose texture an earlier one
+		/// already names, which Frame::canRenderInto refuses however the
+		/// images differ (one texture as two colour targets), and colour 0 of
+		/// an array, cube or volume beside a 2D depth texture, whose plane
+		/// would otherwise be the array's companion and sample as an array
+		/// (G64). The stand-in for colour 0 then carries the depth.
+		TextureEacp m_proxy[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS];
+		bool        m_proxied[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS] = {};
 		uint8_t  m_num    = 0;
 		uint16_t m_depth  = kInvalidHandle;
 		uint16_t m_target = kInvalidHandle;
 		bool m_valid      = false;
+
+		/// Whether a pass over it goes through ColorTarget (several colour
+		/// attachments, or any image other than level 0, slice 0).
+		bool needsTargets() const
+		{
+			if (1 < m_num
+			||  m_proxied[0])
+			{
+				return true;
+			}
+
+			return 0 == m_num
+				? !m_depthSub.isDefault()
+				: !m_sub[0].isDefault()
+				;
+		}
+
+		/// The image a pass renders into: colour attachment 0's, or a
+		/// depth-only framebuffer's depth attachment's.
+		const Sub& targetSub() const
+		{
+			return 0 == m_num ? m_depthSub : m_sub[0];
+		}
+	};
+
+	/// A framebuffer stand-in of the open pass and the image it is copied
+	/// into when the pass closes (FrameBufferEacp::m_proxy).
+	struct ProxyCopy
+	{
+		const GPU::Texture* m_proxy = NULL;
+		const GPU::Texture* m_image = NULL;
+		int  m_level = 0;
+		int  m_slice = 0;
+		bool m_load  = false;
 	};
 
 	struct PipelineEacp
@@ -1833,6 +1909,11 @@ namespace bgfx { namespace eacp
 				// BGFX_CAPS_FORMAT_TEXTURE_3D (fillFormatCaps); bgfx has no
 				// caps bit for either.
 				| (device.supportsCubeArrays() ? BGFX_CAPS_TEXTURE_CUBE_ARRAY : 0)
+				// A framebuffer attachment of several layers is one layered
+				// pass (ColorTarget::layerCount), the vertex shader choosing
+				// each primitive's with gl_Layer, which eacp-metal compiles to
+				// [[render_target_array_index]].
+				| (device.supportsLayeredRendering() ? BGFX_CAPS_VIEWPORT_LAYER_ARRAY : 0)
 				;
 
 			fillFormatCaps(device);
@@ -2294,14 +2375,18 @@ namespace bgfx { namespace eacp
 		}
 
 		/// A framebuffer of textures. Up to maxFBAttachments colour attachments
-		/// and one depth attachment, each at mip and layer 0 (G15). The pass
-		/// renders into the colour textures, the first remade here with a depth
-		/// plane when the framebuffer has a depth attachment (eacp's depth is
-		/// the first target's, G36); a depth-only framebuffer renders into a
-		/// colour target the depth texture gets for itself. Either way the
-		/// depth texture remembers which target carries its plane, for
-		/// sampling. The colour textures must be one size and one sample count,
-		/// as Frame::beginMultiTargetPass asks.
+		/// and one depth attachment, each at its own mip and layer (or run of
+		/// layers, which is layered rendering): the pass renders into those
+		/// images of the colour textures (Frame::beginMultiTargetPass over
+		/// ColorTargets), the first remade here with a depth plane when the
+		/// framebuffer has a depth attachment (eacp's depth is the first
+		/// target's, attached at its level and slice, G36); a depth-only
+		/// framebuffer renders into a colour target the depth texture gets for
+		/// itself, of the depth texture's kind. Either way the depth texture
+		/// remembers which target carries its plane, for sampling. The images
+		/// must be one size and one sample count, and the runs one length, as
+		/// Frame::beginMultiTargetPass asks; one texture may appear twice at
+		/// two different images.
 		void createFrameBuffer(FrameBufferHandle _handle, uint8_t _num, const Attachment* _attachment) override
 		{
 			FrameBufferEacp& fb = m_frameBuffers[_handle.idx];
@@ -2316,19 +2401,26 @@ namespace bgfx { namespace eacp
 					continue;
 				}
 
-				if (0 != at.mip
-				||  0 != at.layer
-				||  1 < at.numLayers)
+				FrameBufferEacp::Sub sub;
+				sub.m_level  = at.mip;
+				sub.m_slice  = at.layer;
+				sub.m_layers = bx::max<uint16_t>(1, at.numLayers);
+
+				if (1 < sub.m_layers
+				&&  !GPU::Device::shared().supportsLayeredRendering() )
 				{
-					traceOnce(Unsupported::FrameBufferLayer, "G15: a framebuffer attachment of a mip level or layer other than 0 renders into level 0, layer 0.");
+					traceOnce(Unsupported::FrameBufferLayer, "a framebuffer attachment of several layers on a device without layered rendering renders into the first.");
+					sub.m_layers = 1;
 				}
 
 				if (m_textures[at.handle.idx].m_depthFormat)
 				{
-					fb.m_depth = at.handle.idx;
+					fb.m_depth    = at.handle.idx;
+					fb.m_depthSub = sub;
 				}
 				else if (fb.m_num < g_caps.limits.maxFBAttachments)
 				{
+					fb.m_sub[fb.m_num]     = sub;
 					fb.m_color[fb.m_num++] = at.handle.idx;
 				}
 			}
@@ -2340,27 +2432,85 @@ namespace bgfx { namespace eacp
 				if (!color.isTarget()
 				||  !isRenderable(color.m_format) )
 				{
-					traceOnce(Unsupported::FrameBufferFormat, "G4: a framebuffer with a colour texture eacp cannot render into (R8, RG8, a cube, a refused format) is not drawn.");
+					traceOnce(Unsupported::FrameBufferFormat, "G4: a framebuffer with a colour texture eacp cannot render into (R8, RG8, a refused format) is not drawn.");
 					return;
 				}
 
 				const TextureEacp& first = m_textures[fb.m_color[0] ];
+				const FrameBufferEacp::Sub& sub      = fb.m_sub[ii];
+				const FrameBufferEacp::Sub& firstSub = fb.m_sub[0];
 
 				bool duplicate = false;
 
 				for (uint8_t jj = 0; jj < ii; ++jj)
 				{
-					duplicate |= fb.m_color[jj] == fb.m_color[ii];
+					duplicate |= fb.m_color[jj] == fb.m_color[ii] && fb.m_sub[jj] == sub;
 				}
 
 				if (duplicate
-				||  color.m_width  != first.m_width
-				||  color.m_height != first.m_height
+				||  !hasImage(color, sub)
+				||  mipExtent(color.m_width,  sub.m_level) != mipExtent(first.m_width,  firstSub.m_level)
+				||  mipExtent(color.m_height, sub.m_level) != mipExtent(first.m_height, firstSub.m_level)
+				||  sub.m_layers != firstSub.m_layers
 				||  color.m_texture->sampleCount() != first.m_texture->sampleCount() )
 				{
-					traceOnce(Unsupported::FrameBufferColor, "a framebuffer whose colour attachments differ in size or sample count, or repeat a texture, is not drawn (eacp refuses the pass).");
+					traceOnce(Unsupported::FrameBufferColor, "a framebuffer whose colour attachments differ in size, sample count or layers, name an image their texture lacks, or repeat one image, is not drawn (eacp refuses the pass).");
 					return;
 				}
+			}
+
+			// Stand-ins (FrameBufferEacp::m_proxy): a repeated texture, and
+			// colour 0 of another kind than a 2D depth texture beside it.
+			for (uint8_t ii = 0; ii < fb.m_num; ++ii)
+			{
+				const TextureEacp& color = m_textures[fb.m_color[ii] ];
+				const FrameBufferEacp::Sub& sub = fb.m_sub[ii];
+
+				bool proxied = 0 == ii
+					&& kInvalidHandle != fb.m_depth
+					&& GPU::TextureType::TwoD == m_textures[fb.m_depth].m_kind
+					&& GPU::TextureType::TwoD != color.m_kind
+					;
+
+				for (uint8_t jj = 0; jj < ii; ++jj)
+				{
+					proxied |= fb.m_color[jj] == fb.m_color[ii] && !fb.m_proxied[jj];
+				}
+
+				if (!proxied)
+				{
+					continue;
+				}
+
+				if (1 < sub.m_layers)
+				{
+					traceOnce(Unsupported::FrameBufferColor, "a framebuffer naming one texture twice, one of them a run of layers, is not drawn (eacp refuses one texture as two colour targets).");
+					return;
+				}
+
+				TextureEacp& proxy = fb.m_proxy[ii];
+				proxy.destroy();
+				proxy.m_width           = mipExtent(color.m_width,  sub.m_level);
+				proxy.m_height          = mipExtent(color.m_height, sub.m_level);
+				proxy.m_format          = color.m_format;
+				proxy.m_textureFormat   = color.m_textureFormat;
+				proxy.m_requestedFormat = color.m_requestedFormat;
+				proxy.m_flags           = color.m_flags;
+				proxy.m_kind            = GPU::TextureType::TwoD;
+
+				proxy.m_desc = GPU::TextureDescriptor();
+				proxy.m_desc.width        = int(proxy.m_width);
+				proxy.m_desc.height       = int(proxy.m_height);
+				proxy.m_desc.format       = color.m_format;
+				proxy.m_desc.renderTarget = true;
+				proxy.m_desc.sampleCount  = color.m_texture->sampleCount();
+
+				if (!proxy.makeTarget(false, false, false) )
+				{
+					return;
+				}
+
+				fb.m_proxied[ii] = true;
 			}
 
 			if (0 < fb.m_num)
@@ -2379,13 +2529,20 @@ namespace bgfx { namespace eacp
 			if (kInvalidHandle != fb.m_depth)
 			{
 				TextureEacp& depth  = m_textures[fb.m_depth];
-				TextureEacp& target = m_textures[fb.m_target];
+				TextureEacp& target = fb.m_proxied[0] ? fb.m_proxy[0] : m_textures[fb.m_target];
 
 				if (kInvalidHandle != depth.m_depthOf
 				&&  depth.m_depthOf != fb.m_target
 				&&  m_textures[depth.m_depthOf].isTarget() )
 				{
 					traceOnce(Unsupported::FrameBufferDepth, "a depth texture shared by framebuffers with different colour textures is a separate plane in each; sampling it reads the latest.");
+				}
+
+				if (0 < fb.m_num
+				&&  !fb.m_proxied[0]
+				&&  !(fb.m_depthSub == fb.m_sub[0]) )
+				{
+					traceOnce(Unsupported::FrameBufferDepth, "G36: a depth attachment at another level or layer than colour attachment 0 is attached at colour 0's (eacp's depth plane is the first target's).");
 				}
 
 				if (fb.m_target == fb.m_depth
@@ -2403,10 +2560,44 @@ namespace bgfx { namespace eacp
 					return;
 				}
 
-				depth.m_depthOf = fb.m_target;
+				if (0 == fb.m_num
+				&&  !hasImage(target, fb.m_depthSub) )
+				{
+					traceOnce(Unsupported::FrameBufferColor, "a framebuffer whose colour attachments differ in size, sample count or layers, name an image their texture lacks, or repeat one image, is not drawn (eacp refuses the pass).");
+					return;
+				}
+
+				depth.m_depthOf    = fb.m_target;
+				depth.m_depthProxy = fb.m_proxied[0] ? _handle.idx : kInvalidHandle;
 			}
 
 			fb.m_valid = true;
+		}
+
+		/// Whether a render target has the level and the run of slices (a
+		/// volume's z at that level) an attachment names; a run on a volume
+		/// starts at z 0.
+		static bool hasImage(const TextureEacp& _texture, const FrameBufferEacp::Sub& _sub)
+		{
+			if (!_texture.m_texture
+			||  _sub.m_level >= _texture.m_texture->mipLevels() )
+			{
+				return false;
+			}
+
+			const uint32_t extent = GPU::TextureType::ThreeD == _texture.m_texture->kind()
+				? mipExtent(uint32_t(_texture.m_texture->volumeDepth() ), _sub.m_level)
+				: uint32_t(_texture.m_texture->slices() )
+				;
+
+			if (GPU::TextureType::ThreeD == _texture.m_texture->kind()
+			&&  1 < _sub.m_layers
+			&&  0 != _sub.m_slice)
+			{
+				return false;
+			}
+
+			return uint32_t(_sub.m_slice) + _sub.m_layers <= extent;
 		}
 
 		void createFrameBuffer(FrameBufferHandle _handle, const SwapChain& /*_desc*/) override
@@ -2886,7 +3077,8 @@ namespace bgfx { namespace eacp
 		/// sampled: made sampleable, and not the target of the open pass.
 		const TextureEacp* depthCarrier(uint16_t _depth) const
 		{
-			const uint16_t idx = m_textures[_depth].m_depthOf;
+			const uint16_t idx   = m_textures[_depth].m_depthOf;
+			const uint16_t proxy = m_textures[_depth].m_depthProxy;
 
 			if (kInvalidHandle == idx
 			||  idx == m_passTexture)
@@ -2894,7 +3086,16 @@ namespace bgfx { namespace eacp
 				return NULL;
 			}
 
-			const TextureEacp& carrier = m_textures[idx];
+			if (kInvalidHandle != proxy
+			&&  !m_frameBuffers[proxy].m_proxied[0])
+			{
+				return NULL;
+			}
+
+			const TextureEacp& carrier = kInvalidHandle != proxy
+				? m_frameBuffers[proxy].m_proxy[0]
+				: m_textures[idx]
+				;
 
 			if (!carrier.isTarget()
 			||  !carrier.m_texture->hasSampleableDepth() )
@@ -2993,7 +3194,7 @@ namespace bgfx { namespace eacp
 
 			if (!m_computePass)
 			{
-				m_pass.reset();
+				closeRenderPass();
 				m_passTexture  = kInvalidHandle;
 				m_passNumColor = 0;
 				m_computePass.emplace(ComputePassMaker{ _frame, _viewName });
@@ -3020,6 +3221,9 @@ namespace bgfx { namespace eacp
 			}
 
 			const RenderBind& renderBind = _render->m_renderBind[_compute.m_bindIdx];
+
+			// A write image the kernel cannot be given (G67).
+			bool unbound = false;
 
 			for (uint8_t stage = 0; stage < g_caps.limits.maxComputeBindings; ++stage)
 			{
@@ -3056,28 +3260,52 @@ namespace bgfx { namespace eacp
 					{
 						const TextureEacp& texture = m_textures[bind.m_idx];
 
-						if (!texture.m_texture)
+						// setImage's mip is one level of the texture, every
+						// slice of it (setOutputTextureLevel,
+						// setInputTextureLevel); level 0 is the whole texture's
+						// own bind. An image the kernel would write and eacp
+						// cannot bind for writing (G14 formats, a cube, G66; a
+						// level the texture lacks) leaves the slot to whatever
+						// texture is there, which Metal's validation stops on:
+						// the dispatch is skipped instead (G67).
+						const uint8_t mip   = bind.m_firstMip;
+						const bool    write = Access::Read != bind.m_access;
+
+						if (!texture.m_texture
+						||  mip >= texture.m_texture->mipLevels() )
 						{
-							traceOnce(Unsupported::ComputeBind, "a compute binding of a buffer or texture that does not exist is left unbound.");
-						}
-						else if (0 != bind.m_firstMip)
-						{
-							traceOnce(Unsupported::ComputeImageMip, "G15: a storage image of a mip level other than 0 is left unbound (eacp has no level views).");
+							traceOnce(Unsupported::ComputeBind, "a compute binding of a buffer, texture or mip level that does not exist is left unbound.");
+							unbound |= write;
 						}
 						else if (texture.m_texture->isComputeWritable() )
 						{
-							pass.setOutputTexture(*texture.m_texture, stage);
+							if (0 == mip)
+							{
+								pass.setOutputTexture(*texture.m_texture, stage);
+							}
+							else
+							{
+								pass.setOutputTextureLevel(*texture.m_texture, stage, int(mip) );
+							}
 						}
-						else if (Access::Read == bind.m_access)
+						else if (!write)
 						{
 							// access::read needs only ShaderRead, which every
 							// eacp texture has; the sampler bound beside it is
 							// unused.
-							pass.setInputTexture(*texture.m_texture, stage, getSampler(BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
+							if (0 == mip)
+							{
+								pass.setInputTexture(*texture.m_texture, stage, getSampler(BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
+							}
+							else
+							{
+								pass.setInputTextureLevel(*texture.m_texture, stage, int(mip) );
+							}
 						}
 						else
 						{
-							traceOnce(Unsupported::ComputeImageFormat, "G14: a storage image written in a format eacp cannot compute-write is left unbound.");
+							traceOnce(Unsupported::ComputeImageFormat, "G14/G66: a kernel writing an image eacp cannot compute-write (format, or a cube) is not dispatched.");
+							unbound = true;
 						}
 					}
 					break;
@@ -3113,6 +3341,11 @@ namespace bgfx { namespace eacp
 				default:
 					break;
 				}
+			}
+
+			if (unbound)
+			{
+				return;
 			}
 
 			if (isValid(_compute.m_indirectBuffer) )
@@ -3868,7 +4101,7 @@ namespace bgfx { namespace eacp
 				;
 
 			m_computePass.reset();
-			m_pass.reset();
+			closeRenderPass();
 			m_pass.emplace(PassMaker{ _frame, _descriptor, NULL });
 			m_target          = windowTarget();
 			m_passScaleX      = m_windowScaleX;
@@ -3886,7 +4119,7 @@ namespace bgfx { namespace eacp
 		/// _texture). Its depth plane is kept at the end of every pass, so a
 		/// later view on the same framebuffer that does not clear, or a draw
 		/// sampling the depth, finds it.
-		void beginTexturePass(GPU::Frame& _frame, TextureEacp& _texture, uint16_t _idx, GPU::RenderPassDescriptor& _descriptor, bool _clearDepth, const FrameBufferEacp* _fb = NULL, std::span<const GPU::ColorTarget> _targets = {})
+		void beginTexturePass(GPU::Frame& _frame, TextureEacp& _texture, uint16_t _idx, GPU::RenderPassDescriptor& _descriptor, bool _clearDepth, const FrameBufferEacp* _fb = NULL, std::span<const GPU::ColorTarget> _targets = {}, const uint16_t* _targetIdx = NULL, const FrameBufferEacp::Sub* _targetSub = NULL, std::span<const ProxyCopy> _proxies = {})
 		{
 			_descriptor.depthAction = !_clearDepth && _texture.m_depthKept
 				? GPU::DepthAction::Resume
@@ -3894,7 +4127,26 @@ namespace bgfx { namespace eacp
 				;
 
 			m_computePass.reset();
-			m_pass.reset();
+			closeRenderPass();
+
+			// Stand-ins: what a loading pass keeps is copied in first, and
+			// each is copied into its image when this pass closes.
+			for (const ProxyCopy& proxy : _proxies)
+			{
+				if (proxy.m_load)
+				{
+					GPU::TextureCopyRegion region;
+					region.sourceLevel = proxy.m_level;
+					region.sourceSlice = proxy.m_slice;
+					region.size.depth  = 1;
+					_frame.copy(*proxy.m_image, *proxy.m_proxy, region);
+				}
+
+				m_resolves[m_numResolves++] = proxy;
+			}
+
+			m_resolveFrame = &_frame;
+
 			m_pass.emplace(PassMaker{ _frame, _descriptor, &*_texture.m_texture, _targets });
 			m_target            = textureTarget(_texture, _targets.empty() ? NULL : _fb);
 			m_passScaleX        = 1.0f;
@@ -3904,8 +4156,13 @@ namespace bgfx { namespace eacp
 
 			if (!_targets.empty() )
 			{
-				m_passNumColor = _fb->m_num;
-				bx::memCopy(m_passColor, _fb->m_color, sizeof(m_passColor) );
+				m_passNumColor = uint8_t(_targets.size() );
+
+				for (uint8_t ii = 0; ii < m_passNumColor; ++ii)
+				{
+					m_passColor[ii] = _targetIdx[ii];
+					m_passSub[ii]   = _targetSub[ii];
+				}
 			}
 			_texture.m_depthKept = true;
 			m_needFlush         = true;
@@ -3913,12 +4170,32 @@ namespace bgfx { namespace eacp
 			m_lastPipeline      = NULL;
 		}
 
+		/// Ends the open render pass, then copies each framebuffer stand-in it
+		/// rendered into the image it stands for (FrameBufferEacp::m_proxy).
+		void closeRenderPass()
+		{
+			m_pass.reset();
+
+			for (uint8_t ii = 0; ii < m_numResolves; ++ii)
+			{
+				const ProxyCopy& proxy = m_resolves[ii];
+
+				GPU::TextureCopyRegion region;
+				region.destinationLevel = proxy.m_level;
+				region.destinationSlice = proxy.m_slice;
+				region.size.depth       = 1;
+				m_resolveFrame->copy(*proxy.m_proxy, *proxy.m_image, region);
+			}
+
+			m_numResolves = 0;
+		}
+
 		/// Ends whichever pass is open, render or compute: a command buffer
 		/// takes one encoder at a time.
 		void endPass()
 		{
 			m_computePass.reset();
-			m_pass.reset();
+			closeRenderPass();
 			m_passTexture  = kInvalidHandle;
 			m_passNumColor = 0;
 		}
@@ -3951,10 +4228,12 @@ namespace bgfx { namespace eacp
 		/// DepthAction::Resume, as after a dispatch). bgfx asks that both
 		/// textures of a blit have one format, which is what a copy asks, so
 		/// every blit eacp can name is a copy and nothing is drawn: what is
-		/// left out is what eacp cannot hold (a depth texture, G36; a level a
-		/// render target was not given, G6; more than one image of a volume,
-		/// G15) and a buffer copy of a widened format, whose bytes differ (G4).
-		/// A blit of several layers is a copy per layer.
+		/// left out is what eacp cannot hold (a depth texture, G36; a level or
+		/// slice the texture lacks), a volume to or from another kind, more
+		/// than one image between a buffer and a texture, and a buffer copy of
+		/// a widened format, whose bytes differ (G4). A blit of several layers
+		/// is one copy of a run of slices (sliceCount), of a volume's images
+		/// one copy of a box (z and depth).
 		void submitBlit(GPU::Frame& _frame, const BlitItem& _blit)
 		{
 			endPass();
@@ -3993,7 +4272,14 @@ namespace bgfx { namespace eacp
 
 				if (1 < _blit.m_depth)
 				{
-					traceOnce(Unsupported::BlitLevel, "G15: a blit between a buffer and more than one layer or image of a texture copies the first.");
+					traceOnce(Unsupported::BlitLevel, "a blit between a buffer and more than one layer or image of a texture copies the first (eacp's buffer-texture copies are one image).");
+				}
+
+				if (texture.isVolume()
+				&&  0 != z)
+				{
+					traceOnce(Unsupported::BlitVolume, "a blit between a buffer and a 3D texture's image past the first is skipped (eacp's buffer-texture copies take no z).");
+					return;
 				}
 
 				if (bimg::TextureFormat::Count != widenedFormat(texture.m_textureFormat) )
@@ -4031,39 +4317,35 @@ namespace bgfx { namespace eacp
 				return;
 			}
 
-			// A volume's images are z at slice 0 (one image a copy, G15),
-			// anything else's layers and faces are slices, one copy each.
-			for (uint16_t ii = 0; ii < bx::max<uint16_t>(1, _blit.m_depth); ++ii)
+			// One copy: a volume's images are a box of z at slice 0 (both sides
+			// volumes, eacp copying a volume only to or from one), anything
+			// else's layers and faces a run of slices (sliceCount).
+			const uint16_t depth = bx::max<uint16_t>(1, _blit.m_depth);
+
+			if (src.isVolume() != dst.isVolume() )
 			{
-				const uint16_t srcZ = _blit.m_srcZ + ii;
-				const uint16_t dstZ = _blit.m_dstZ + ii;
-
-				GPU::TextureCopyRegion region;
-				region.sourceLevel       = _blit.m_srcMip;
-				region.sourceSlice       = src.isVolume() ? 0 : srcZ;
-				region.sourceOrigin      = { int(_blit.m_srcX), int(_blit.m_srcY), src.isVolume() ? int(srcZ) : 0 };
-				region.destinationLevel  = _blit.m_dstMip;
-				region.destinationSlice  = dst.isVolume() ? 0 : dstZ;
-				region.destinationOrigin = { int(_blit.m_dstX), int(_blit.m_dstY), dst.isVolume() ? int(dstZ) : 0 };
-				region.size              = { int(_blit.m_width), int(_blit.m_height), 1 };
-
-				_frame.copy(*src.m_texture, *dst.m_texture, region);
+				traceOnce(Unsupported::BlitVolume, "a blit between a 3D texture and another kind is skipped (eacp copies a volume only to or from a volume).");
+				return;
 			}
+
+			GPU::TextureCopyRegion region;
+			region.sourceLevel       = _blit.m_srcMip;
+			region.sourceSlice       = src.isVolume() ? 0 : _blit.m_srcZ;
+			region.sourceOrigin      = { int(_blit.m_srcX), int(_blit.m_srcY), src.isVolume() ? int(_blit.m_srcZ) : 0 };
+			region.destinationLevel  = _blit.m_dstMip;
+			region.destinationSlice  = dst.isVolume() ? 0 : _blit.m_dstZ;
+			region.destinationOrigin = { int(_blit.m_dstX), int(_blit.m_dstY), dst.isVolume() ? int(_blit.m_dstZ) : 0 };
+			region.size              = { int(_blit.m_width), int(_blit.m_height), src.isVolume() ? int(depth) : 1 };
+			region.sliceCount        = src.isVolume() ? 1 : int(depth);
+
+			_frame.copy(*src.m_texture, *dst.m_texture, region);
 		}
 
 		/// Whether one side of a blit is a texture level eacp has: a colour
 		/// texture (depth has no texture of its own, G36), a level it was made
-		/// with (render targets have one, G6), and slices it has; a volume only
-		/// its first image (eacp's copies take no z yet, G15's second half).
+		/// with, and the slices (a volume's images at that level) it has.
 		bool blitTexture(const TextureEacp& _texture, uint8_t _mip, uint16_t _z, uint16_t _depth)
 		{
-			if (_texture.isVolume()
-			&& (0 != _z || 1 < _depth) )
-			{
-				traceOnce(Unsupported::BlitVolume, "G15: a blit of a 3D texture's images past the first is skipped (eacp copies take no z yet).");
-				return false;
-			}
-
 			if (_texture.m_depthFormat)
 			{
 				traceOnce(Unsupported::BlitDepth, "G36: a blit to or from a depth texture is skipped (no eacp depth texture to copy).");
@@ -4138,7 +4420,7 @@ namespace bgfx { namespace eacp
 			bool viewSkipped = true;
 			bool viewBegun   = false; // the view's first draw has opened (or joined) its pass
 			TextureEacp* viewTarget = NULL;
-			const FrameBufferEacp* viewFrameBuffer = NULL;
+			FrameBufferEacp* viewFrameBuffer = NULL;
 			Rect viewScissorRect;
 			viewScissorRect.clear();
 			uint16_t currentScissor = UINT16_MAX - 1;
@@ -4630,7 +4912,7 @@ namespace bgfx { namespace eacp
 		/// (the pass's own clear), otherwise the open pass carries on and a
 		/// partial clear is the clear quad. A texture target's rects are in its
 		/// own pixels.
-		void beginView(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, const View& _view, const char* _viewName, TextureEacp* _target, const FrameBufferEacp* _fb, Rect& _viewScissorRect, bool _clear)
+		void beginView(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, const View& _view, const char* _viewName, TextureEacp* _target, FrameBufferEacp* _fb, Rect& _viewScissorRect, bool _clear)
 		{
 			Clear clear = _view.m_clear;
 
@@ -4651,7 +4933,9 @@ namespace bgfx { namespace eacp
 			}
 			else
 			{
-				targetRect = Rect(0, 0, uint16_t(_target->m_texture->width() ), uint16_t(_target->m_texture->height() ) );
+				// The level the framebuffer renders into.
+				const uint8_t level = NULL != _fb ? _fb->targetSub().m_level : 0;
+				targetRect = Rect(0, 0, uint16_t(mipExtent(uint32_t(_target->m_texture->width() ), level) ), uint16_t(mipExtent(uint32_t(_target->m_texture->height() ), level) ) );
 			}
 
 			Rect clippedRect;
@@ -4672,7 +4956,14 @@ namespace bgfx { namespace eacp
 
 			const bool clearsColor        = 0 != (flags & BGFX_CLEAR_COLOR);
 			const bool clearsDepthStencil = 0 != (flags & (BGFX_CLEAR_DEPTH|BGFX_CLEAR_STENCIL) );
-			const bool hasStencil = NULL == _target ? windowHasStencil() : _target->m_texture->hasStencil();
+			// The texture whose depth plane the pass attaches: colour 0's
+			// stand-in where it has one.
+			TextureEacp* passTarget = NULL != _fb && 0 < _fb->m_num && _fb->m_proxied[0]
+				? &_fb->m_proxy[0]
+				: _target
+				;
+
+			const bool hasStencil = NULL == _target ? windowHasStencil() : passTarget->m_texture->hasStencil();
 
 			// G29: a pass clears depth and stencil together, depth to the far
 			// plane. A clear of one plane only (with a stencil plane there to
@@ -4688,14 +4979,42 @@ namespace bgfx { namespace eacp
 
 			uint16_t quadFlags = flags;
 
-			// A framebuffer of several colour attachments is one pass over all
-			// of them (Frame::beginMultiTargetPass), and the same pass only
-			// while the attachments are the same.
-			const uint8_t numColor = NULL != _fb && 1 < _fb->m_num ? _fb->m_num : 0;
-			const bool sameColors = true
-				&& numColor == m_passNumColor
-				&& (0 == numColor || 0 == bx::memCmp(m_passColor, _fb->m_color, numColor*sizeof(uint16_t) ) )
-				;
+			// A framebuffer of several colour attachments, or of an image other
+			// than level 0, slice 0 of its texture, is one pass over
+			// ColorTargets (Frame::beginMultiTargetPass), and the same pass
+			// only while the attachments and their images are the same. A
+			// depth-only one at a layer is its carrier at that layer.
+			uint8_t numColor = 0;
+			uint16_t passIdx[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS];
+			FrameBufferEacp::Sub passSub[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS] = {};
+
+			if (NULL != _fb
+			&&  _fb->needsTargets() )
+			{
+				if (0 == _fb->m_num)
+				{
+					passIdx[0] = _fb->m_target;
+					passSub[0] = _fb->m_depthSub;
+					numColor   = 1;
+				}
+				else
+				{
+					numColor = _fb->m_num;
+
+					for (uint8_t ii = 0; ii < numColor; ++ii)
+					{
+						passIdx[ii] = _fb->m_color[ii];
+						passSub[ii] = _fb->m_sub[ii];
+					}
+				}
+			}
+
+			bool sameColors = numColor == m_passNumColor;
+
+			for (uint8_t ii = 0; ii < numColor && sameColors; ++ii)
+			{
+				sameColors = passIdx[ii] == m_passColor[ii] && passSub[ii] == m_passSub[ii];
+			}
 			const bool samePass = m_pass && m_passTexture == targetIdx && sameColors;
 
 			if (!samePass
@@ -4721,11 +5040,36 @@ namespace bgfx { namespace eacp
 				// UINT8_MAX.
 				GPU::ColorTarget targets[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS];
 
+				ProxyCopy proxies[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS];
+				uint8_t numProxies = 0;
+
 				for (uint8_t ii = 0; ii < numColor; ++ii)
 				{
-					targets[ii].texture    = &*m_textures[_fb->m_color[ii] ].m_texture;
+					targets[ii].texture    = &*m_textures[passIdx[ii] ].m_texture;
 					targets[ii].clear      = descriptor.clear && (!palette || UINT8_MAX != clear.m_index[ii]);
 					targets[ii].clearColor = clearColor(clear, _render->m_colorPalette, ii);
+					targets[ii].level      = int(passSub[ii].m_level);
+					targets[ii].slice      = int(passSub[ii].m_slice);
+					targets[ii].layerCount = int(passSub[ii].m_layers);
+
+					if (0 < _fb->m_num
+					&&  _fb->m_proxied[ii])
+					{
+						// Rendered into the stand-in, copied into the image
+						// when the pass ends (and out of it first when the
+						// pass loads).
+						ProxyCopy& proxy = proxies[numProxies++];
+						proxy.m_proxy = &*_fb->m_proxy[ii].m_texture;
+						proxy.m_image = targets[ii].texture;
+						proxy.m_level = targets[ii].level;
+						proxy.m_slice = targets[ii].slice;
+						proxy.m_load  = !targets[ii].clear;
+
+						targets[ii].texture    = proxy.m_proxy;
+						targets[ii].level      = 0;
+						targets[ii].slice      = 0;
+						targets[ii].layerCount = 1;
+					}
 				}
 
 				if (passClearsDepth)
@@ -4745,7 +5089,7 @@ namespace bgfx { namespace eacp
 				}
 				else
 				{
-					beginTexturePass(_frame, *_target, targetIdx, descriptor, passClearsDepth, _fb, std::span<const GPU::ColorTarget>(targets, numColor) );
+					beginTexturePass(_frame, *passTarget, targetIdx, descriptor, passClearsDepth, _fb, std::span<const GPU::ColorTarget>(targets, numColor), passIdx, passSub, std::span<const ProxyCopy>(proxies, numProxies) );
 				}
 			}
 
@@ -5020,6 +5364,10 @@ namespace bgfx { namespace eacp
 		uint16_t m_passTexture     = kInvalidHandle; // the open pass's texture target, or the window
 		uint16_t m_passColor[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS] = {}; // ... and its colour attachments, when several
 		uint8_t  m_passNumColor    = 0;
+		FrameBufferEacp::Sub m_passSub[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS]; // ... and the image of each
+		ProxyCopy   m_resolves[BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS]; // the open pass's stand-ins, copied into their images when it closes
+		uint8_t     m_numResolves  = 0;
+		GPU::Frame* m_resolveFrame = NULL;
 		bool     m_windowDepthKept = false;          // a window pass this frame kept the depth plane
 		bool     m_needFlush       = false;          // passes recorded since the last Frame::flush
 		float    m_passScaleX       = 1.0f;           // the open pass's target pixels per bgfx unit
