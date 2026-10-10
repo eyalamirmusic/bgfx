@@ -628,6 +628,11 @@ namespace bgfx { namespace eacp
 			bx::read(&reader, size, &err);
 			m_size = bx::max<uint32_t>(bx::max<uint32_t>(size, blockSize), globalBlockSize(m_code) );
 
+			if (!isShaderType(m_magic, 'C') )
+			{
+				m_numStorage = uint8_t(bx::max<uint32_t>(m_numStorage, renderStorageCount(m_code) ) );
+			}
+
 			bx::HashMurmur3 murmur;
 			murmur.begin();
 			murmur.add(hashIn);
@@ -636,6 +641,28 @@ namespace bgfx { namespace eacp
 			m_hash = murmur.end();
 
 			return true;
+		}
+
+		/// How many render-stage storage buffers the MSL declares: eacp-metal
+		/// puts BUFFER_RO/RW at stage n on [[buffer(bufferBase + n)]], and the
+		/// uniform table does not always list them (41-tess's
+		/// vs_terrain_render reads three and lists none).
+		static uint32_t renderStorageCount(const std::string& _msl)
+		{
+			static const char s_tag[] = "[[buffer(";
+			uint32_t count = 0;
+
+			for (size_t pos = _msl.find(s_tag); std::string::npos != pos; pos = _msl.find(s_tag, pos) )
+			{
+				pos += sizeof(s_tag) - 1;
+
+				if (atoi(_msl.c_str() + pos) >= GPU::RenderPass::bufferBase)
+				{
+					++count;
+				}
+			}
+
+			return count;
 		}
 
 		/// The size of the MSL `struct _Global`, which the bound bytes must
@@ -866,13 +893,12 @@ namespace bgfx { namespace eacp
 				return createCompute(*_vsh);
 			}
 
+			parseAttributes(_vsh->m_code);
+
 			if (NULL == _fsh)
 			{
-				BX_TRACE("eacp: a program without a fragment shader is not drawn.");
-				return true;
+				return createVertexOnly(*_vsh);
 			}
-
-			parseAttributes(_vsh->m_code);
 
 			GPU::ShaderSource source = GPU::ShaderSource::msl(programSource(_vsh->m_code, _fsh->m_code) );
 			source.withVertex("bgfx_vs::xlatMtlMain");
@@ -883,6 +909,28 @@ namespace bgfx { namespace eacp
 			if (!m_library->isValid() )
 			{
 				BX_TRACE("eacp: the program's MSL does not compile.");
+				m_library.reset();
+				return false;
+			}
+
+			return true;
+		}
+
+		/// createProgram(vsh, invalid): a depth or stencil only program. One
+		/// stage, so no namespaces, and a library without a fragment entry
+		/// (G56), whose pipelines write no colour (writtenColorTarget) while
+		/// still naming the pass's colour formats.
+		bool createVertexOnly(const ShaderEacp& _vsh)
+		{
+			GPU::ShaderSource source = GPU::ShaderSource::msl(_vsh.m_code);
+			source.withVertex("xlatMtlMain");
+			source.withFragment({});
+
+			m_library.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+
+			if (!m_library->isValid() )
+			{
+				BX_TRACE("eacp: the vertex-only program's MSL does not compile.");
 				m_library.reset();
 				return false;
 			}
@@ -946,15 +994,17 @@ namespace bgfx { namespace eacp
 
 	/// bgfx's texture format as the eacp one, for what eacp has (G4 is the
 	/// rest). A format without one is decoded to BGRA8 when bimg can, which is
-	/// what g_caps' _EMULATED bits (set by bgfx itself) promise. R16F and RG16F
-	/// are stored wider (widenedFormat), as every depth format is stored as a
-	/// 32-bit float plane.
+	/// what g_caps' _EMULATED bits (set by bgfx itself) promise. R16F, RG16F,
+	/// R16 and RG32F are stored wider (widenedFormat), as every depth format
+	/// is stored as a 32-bit float plane.
 	static bool toEacpFormat(TextureFormat::Enum _format, GPU::TextureFormat& _out)
 	{
 		switch (_format)
 		{
 		case TextureFormat::R16F:    _out = GPU::TextureFormat::R32Float;    return true;
 		case TextureFormat::RG16F:   _out = GPU::TextureFormat::RGBA16Float; return true;
+		case TextureFormat::R16:     _out = GPU::TextureFormat::R32Float;    return true;
+		case TextureFormat::RG32F:   _out = GPU::TextureFormat::RGBA32Float; return true;
 		case TextureFormat::BC1:     _out = GPU::TextureFormat::BC1RGBA;     return true;
 		case TextureFormat::BC2:     _out = GPU::TextureFormat::BC2RGBA;     return true;
 		case TextureFormat::BC3:     _out = GPU::TextureFormat::BC3RGBA;     return true;
@@ -986,6 +1036,11 @@ namespace bgfx { namespace eacp
 		{
 		case TextureFormat::R16F:  return bimg::TextureFormat::R32F;
 		case TextureFormat::RG16F: return bimg::TextureFormat::RGBA16F;
+		// Sampled only: R16's normalized values as floats, and RG32F with
+		// two unused channels (41-tess's height and slope maps, which the
+		// BGRA8 decode clamped and quantised).
+		case TextureFormat::R16:   return bimg::TextureFormat::R32F;
+		case TextureFormat::RG32F: return bimg::TextureFormat::RGBA32F;
 		default:
 			break;
 		}
@@ -1751,6 +1806,7 @@ namespace bgfx { namespace eacp
 				;
 
 			fillFormatCaps(device);
+			m_vertexTextures = device.supportsVertexTextures();
 
 			createFallbackTextures();
 
@@ -1759,7 +1815,9 @@ namespace bgfx { namespace eacp
 			g_caps.limits.maxTextureSize      = 16384;
 			g_caps.limits.maxTextureLayers    = 1;
 			g_caps.limits.maxFBAttachments    = bx::min<uint32_t>(GPU::maxColorAttachments, BGFX_CONFIG_MAX_FRAME_BUFFER_ATTACHMENTS);
-			g_caps.limits.maxTextureSamplers  = bx::min<uint32_t>(g_caps.limits.maxTextureSamplers, 8);
+			// A stage's texture slots, each with its per-bind sampler: 16 on
+			// Metal and Vulkan, 8 on D3D12 (Device::maxTextureSlots).
+			g_caps.limits.maxTextureSamplers  = bx::min<uint32_t>(BGFX_CONFIG_MAX_TEXTURE_SAMPLERS, uint32_t(bx::max(device.maxTextureSlots(), 0) ) );
 			// The device's own storage-buffer slots for a kernel (16 on Metal, 8
 			// on D3D12), within bgfx's bind array; a compute stage's texture or
 			// image binds at texture(stage), which Metal has as many of.
@@ -1796,15 +1854,19 @@ namespace bgfx { namespace eacp
 
 			// What toEacpFormat maps: 2D and cube (eacp's two dimensionalities),
 			// renderable where eacp renders to it. No _SRGB (G4), no 3D (G15),
-			// no _VERTEX (G17), no _MIP_AUTOGEN (G6), _IMAGE_* only where eacp
+			// _VERTEX where the device samples in the vertex stage (G17), no
+			// _MIP_AUTOGEN (G6), _IMAGE_* only where eacp
 			// makes a compute-write texture (G14). _MSAA and _FRAMEBUFFER_MSAA
 			// on what renders, depth included: eacp multisamples a render target
 			// and resolves it (sampleCountFor picks the count the device takes).
 			// bgfx adds _EMULATED to every other format bimg can
 			// decode to BGRA8, and createTexture does that decode.
+			const uint32_t vertex = _device.supportsVertexTextures() ? BGFX_CAPS_FORMAT_TEXTURE_VERTEX : 0;
+
 			const uint32_t sampled = 0
 				| BGFX_CAPS_FORMAT_TEXTURE_2D
 				| BGFX_CAPS_FORMAT_TEXTURE_CUBE
+				| vertex
 				;
 
 			g_caps.formats[TextureFormat::BGRA8  ] = renderable | sampled | BGFX_CAPS_FORMAT_TEXTURE_BACKBUFFER;
@@ -1818,6 +1880,10 @@ namespace bgfx { namespace eacp
 			// Stored as R32F and RGBA16F (widenedFormat).
 			g_caps.formats[TextureFormat::R16F   ] = renderable | sampled;
 			g_caps.formats[TextureFormat::RG16F  ] = renderable | sampled;
+
+			// Stored as R32F and RGBA32F, sampled only (widenedFormat).
+			g_caps.formats[TextureFormat::R16    ] = sampled;
+			g_caps.formats[TextureFormat::RG32F  ] = sampled;
 
 			// eacp has no attachment format for one or two channels (PixelFormat),
 			// so these sample but are not rendered into (G4).
@@ -1842,6 +1908,7 @@ namespace bgfx { namespace eacp
 			// so D16 and D24 are stored at more precision than asked.
 			const uint32_t depth = 0
 				| BGFX_CAPS_FORMAT_TEXTURE_2D
+				| vertex
 				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER
 				| BGFX_CAPS_FORMAT_TEXTURE_MSAA
 				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER_MSAA
@@ -2673,18 +2740,20 @@ namespace bgfx { namespace eacp
 			return it->second;
 		}
 
-		/// Every texture the fragment stage declares, from the draw's binding
+		/// Every texture one shader stage declares, from the draw's binding
 		/// at that stage, or the fallback when the draw has none there or its
-		/// texture could not be made (or is the wrong dimension).
-		void bindTextures(GPU::RenderPass& _pass, const ShaderEacp& _fsh, const RenderBind& _renderBind)
+		/// texture could not be made (or is the wrong dimension). A sampler
+		/// entry without kUniformFragmentBit is the vertex shader's, bound
+		/// through the vertex siblings of the fragment binds (G17).
+		void bindTextures(GPU::RenderPass& _pass, const ShaderEacp& _shader, const RenderBind& _renderBind, bool _vertex)
 		{
-			for (uint8_t ii = 0; ii < _fsh.m_numSamplers; ++ii)
+			for (uint8_t ii = 0; ii < _shader.m_numSamplers; ++ii)
 			{
-				const ShaderEacp::Sampler& slot = _fsh.m_samplers[ii];
+				const ShaderEacp::Sampler& slot = _shader.m_samplers[ii];
 
 				if (slot.m_stage >= g_caps.limits.maxTextureSamplers)
 				{
-					traceOnce(Unsupported::SamplerSlot, "G17: a texture past eacp's 8 slots is not bound.");
+					traceOnce(Unsupported::SamplerSlot, "a texture past the device's texture slots (Device::maxTextureSlots) is not bound.");
 					continue;
 				}
 
@@ -2718,7 +2787,17 @@ namespace bgfx { namespace eacp
 							carrier = &m_fallbackDepth;
 						}
 
-						_pass.setFragmentDepthTexture(*carrier->m_texture, slot.m_stage, getSampler(flags, lodMin, lodMax) );
+						const GPU::Sampler& sampler = getSampler(flags, lodMin, lodMax);
+
+						if (_vertex)
+						{
+							_pass.setVertexDepthTexture(*carrier->m_texture, slot.m_stage, sampler);
+						}
+						else
+						{
+							_pass.setFragmentDepthTexture(*carrier->m_texture, slot.m_stage, sampler);
+						}
+
 						continue;
 					}
 					else if (!texture->m_texture
@@ -2735,7 +2814,16 @@ namespace bgfx { namespace eacp
 					flags   = uint32_t(texture->m_flags);
 				}
 
-				_pass.setFragmentTexture(*texture->m_texture, slot.m_stage, getSampler(flags, lodMin, lodMax) );
+				const GPU::Sampler& sampler = getSampler(flags, lodMin, lodMax);
+
+				if (_vertex)
+				{
+					_pass.setVertexTexture(*texture->m_texture, slot.m_stage, sampler);
+				}
+				else
+				{
+					_pass.setFragmentTexture(*texture->m_texture, slot.m_stage, sampler);
+				}
 			}
 		}
 
@@ -3307,7 +3395,7 @@ namespace bgfx { namespace eacp
 			murmur.add(_stencil);
 			murmur.add(_program.idx);
 			murmur.add(program.m_vsh->m_hash);
-			murmur.add(program.m_fsh->m_hash);
+			murmur.add(NULL != program.m_fsh ? program.m_fsh->m_hash : 0);
 			murmur.add(_numStreams);
 			murmur.add(_numInstanceData);
 			murmur.add(_rgba);
@@ -3854,7 +3942,7 @@ namespace bgfx { namespace eacp
 
 				if (bimg::TextureFormat::Count != widenedFormat(texture.m_textureFormat) )
 				{
-					traceOnce(Unsupported::BlitWidened, "G4: a blit between a buffer and an R16F or RG16F texture (stored wider) is skipped.");
+					traceOnce(Unsupported::BlitWidened, "G4: a blit between a buffer and a texture stored wider (R16F, RG16F, R16, RG32F) is skipped.");
 					return;
 				}
 
@@ -4119,9 +4207,10 @@ namespace bgfx { namespace eacp
 					continue;
 				}
 
-				if (0 != program->m_vsh->m_numSamplers)
+				if (0 != program->m_vsh->m_numSamplers
+				&&  !m_vertexTextures)
 				{
-					traceOnce(Unsupported::VertexTexture, "G17: draws whose vertex shader samples a texture are skipped (eacp binds fragment textures only).");
+					traceOnce(Unsupported::VertexTexture, "G17: draws whose vertex shader samples a texture are skipped (the device has no vertex-stage textures).");
 					continue;
 				}
 
@@ -4263,7 +4352,8 @@ namespace bgfx { namespace eacp
 					commit(*program->m_vsh->m_constantBuffer);
 				}
 
-				if (NULL != program->m_fsh->m_constantBuffer)
+				if (NULL != program->m_fsh
+				&&  NULL != program->m_fsh->m_constantBuffer)
 				{
 					commit(*program->m_fsh->m_constantBuffer);
 				}
@@ -4272,7 +4362,16 @@ namespace bgfx { namespace eacp
 
 				bindUniforms(pass, *program);
 
-				bindTextures(pass, *program->m_fsh, renderBind);
+				// A stage is one slot for the whole program in bgfx, so a
+				// texture both shaders name is bound to each of them at the
+				// same index (Metal's vertex and fragment index spaces are
+				// separate; D3D12 and Vulkan share it, and it is the same bind).
+				bindTextures(pass, *program->m_vsh, renderBind, true);
+
+				if (NULL != program->m_fsh)
+				{
+					bindTextures(pass, *program->m_fsh, renderBind, false);
+				}
 
 				if (program->usesStorage() )
 				{
@@ -4873,6 +4972,7 @@ namespace bgfx { namespace eacp
 		uint32_t m_numViewTimes = 0;
 
 		bool    m_perfTrace     = false;
+		bool    m_vertexTextures = false;
 		int64_t m_perfLastBegin = 0;
 		int64_t m_perfFrame     = 0;
 		int64_t m_perfSubmit    = 0;
