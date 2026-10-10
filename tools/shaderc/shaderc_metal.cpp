@@ -365,9 +365,21 @@ namespace bgfx { namespace metal
 		}
 	}
 
+	// eacp-metal: the Metal buffer indices the eacp renderer binds to. Vertex
+	// streams take buffer(0..15) through the vertex descriptor, the uniform block
+	// sits on RenderPass::uniformBase (setVertexBytes/setFragmentBytes slot 0)
+	// and ComputePass::uniformBase, and a render stage's storage buffers start at
+	// RenderPass::bufferBase. A kernel's storage buffers take buffer(slot), as
+	// ComputePass::setInputBuffer binds them. Textures and samplers are
+	// texture(stage)/sampler(stage), as in the stock profile.
+	static const uint32_t kEacpUniformBuffer     = 16;
+	static const uint32_t kEacpStorageBufferBase = 24;
+
 	static bool compile(const Options& _options, uint32_t _version, const std::string& _code, bx::WriterI* _shaderWriter, bx::WriterI* _messageWriter, bool _firstPass)
 	{
 		BX_UNUSED(_version);
+
+		const bool eacp = isEacpProfile(_options);
 
 		bx::ErrorAssert messageErr;
 
@@ -661,6 +673,14 @@ namespace bgfx { namespace metal
 
 						un.num = 0;			// needed?
 						un.regIndex = 0;	// needed?
+
+						if (eacp)
+						{
+							// The eacp renderer has no reflection to find the
+							// texture index by name, so it reads the stage here.
+							un.regIndex = uint16_t(refl.get_decoration(resource.id, spv::DecorationBinding) - textureBindingOffset);
+						}
+
 						un.regCount = 0;	// needed?
 						un.texDimension = spirvDimToTextureDimensionId(uint32_t(type.image.dim), type.image.arrayed);
 
@@ -708,7 +728,7 @@ namespace bgfx { namespace metal
 						unsigned binding = msl.get_decoration(resource.id, spv::DecorationBinding);
 						newBinding.desc_set   = set;
 						newBinding.binding    = binding;
-						newBinding.msl_buffer = 0;
+						newBinding.msl_buffer = eacp ? kEacpUniformBuffer : 0;
 						msl.add_msl_resource_binding(newBinding);
 
 						msl.set_name(resource.id, "_mtl_u");
@@ -720,7 +740,12 @@ namespace bgfx { namespace metal
 						unsigned binding = msl.get_decoration(resource.id, spv::DecorationBinding);
 						newBinding.desc_set   = set;
 						newBinding.binding    = binding;
-						newBinding.msl_buffer = binding + 1;
+						newBinding.msl_buffer = !eacp
+							? binding + 1
+							: 'c' == _options.shaderType
+								? binding
+								: kEacpStorageBufferBase + binding
+							;
 						msl.add_msl_resource_binding(newBinding);
 					}
 
@@ -787,7 +812,12 @@ namespace bgfx { namespace metal
 						}
 					}
 
+					// The sample mask arrives as a function constant, which only a
+					// function specialised with newFunctionWithName:constantValues:
+					// can be built into a pipeline with. eacp neither specialises
+					// functions nor has a sample mask, so eacp-metal leaves it out.
 					if ('f' == _options.shaderType
+					&&  !eacp
 					&&  source.find("[[sample_mask]]") == std::string::npos)
 					{
 						const bx::StringView structOut("struct xlatMtlMain_out\n{");

@@ -107,11 +107,28 @@ namespace bgfx
 	//       1.5      |       1.2      |      1512
 	//       1.6      |       1.3      |      1613
 
+	// eacp profiles (eacp-metal, eacp-spirv, eacp-hlsl) compile exactly as the
+	// profile of the same language and id does, except that resources land on
+	// the slots the eacp renderer binds them to (n is the bgfx texture or
+	// buffer stage):
+	//
+	//                | eacp-metal         | eacp-spirv, one set   | eacp-hlsl
+	//  vertex stream | buffer(0..15)      | input assembler       | input assembler
+	//  uniforms      | buffer(16)         | 0 (kernel: 16)        | b0
+	//  texture n     | texture(n)         | 8 + n                 | t<n>
+	//  sampler n     | sampler(n)         | 32 + n                | s<n>
+	//  storage n     | buffer(24 + n)     | 24 + n (kernel: n)    | as stock
+	//                | (kernel: buffer(n))|                       |
+	//
+	// The binary header and the uniform table's format are every other
+	// profile's. In the table, a texture's or storage buffer's regIndex is
+	// its stage n, whatever binding it was emitted at.
 	struct Profile
 	{
 		ShadingLang::Enum lang;
 		uint32_t id;
 		const bx::StringLiteral name;
+		bool eacp = false;
 	};
 
 	static const Profile s_profiles[] =
@@ -121,6 +138,7 @@ namespace bgfx
 		{  ShadingLang::ESSL,  320,    "320_es"     },
 		{  ShadingLang::HLSL,  400,    "s_4_0"      },
 		{  ShadingLang::HLSL,  500,    "s_5_0"      },
+		{  ShadingLang::HLSL,  500,    "eacp-hlsl",  true },
 		{  ShadingLang::Dxil,  600,    "s_6_0"      },
 		{  ShadingLang::Dxil,  610,    "s_6_1"      },
 		{  ShadingLang::Dxil,  620,    "s_6_2"      },
@@ -142,6 +160,7 @@ namespace bgfx
 		{  ShadingLang::Metal, 2414,   "metal24-14" },
 		{  ShadingLang::Metal, 3014,   "metal30-14" },
 		{  ShadingLang::Metal, 3114,   "metal31-14" },
+		{  ShadingLang::Metal, 1210,   "eacp-metal", true },
 		{  ShadingLang::PSSL,  1000,   "pssl"       },
 		{  ShadingLang::SpirV, 1010,   "spirv"      },
 		{  ShadingLang::SpirV, 1010,   "spirv10-10" },
@@ -149,6 +168,7 @@ namespace bgfx
 		{  ShadingLang::SpirV, 1411,   "spirv14-11" },
 		{  ShadingLang::SpirV, 1512,   "spirv15-12" },
 		{  ShadingLang::SpirV, 1613,   "spirv16-13" },
+		{  ShadingLang::SpirV, 1010,   "eacp-spirv", true },
 		{  ShadingLang::GLSL,  330,    "330"        },
 		{  ShadingLang::GLSL,  400,    "400"        },
 		{  ShadingLang::GLSL,  410,    "410"        },
@@ -1109,6 +1129,21 @@ namespace bgfx
 			  "\n"
 			  "For additional information, see https://github.com/bkaradzic/bgfx\n"
 			);
+	}
+
+	bool isEacpProfile(const Options& _options)
+	{
+		const bx::StringView profileOpt(_options.profile.c_str() );
+
+		for (uint32_t ii = 0; ii < BX_COUNTOF(s_profiles); ++ii)
+		{
+			if (0 == bx::strCmp(profileOpt, s_profiles[ii].name) )
+			{
+				return s_profiles[ii].eacp;
+			}
+		}
+
+		return false;
 	}
 
 	bx::StringView nextWord(bx::StringView& _parse)

@@ -186,6 +186,10 @@ namespace bgfx
 
 	typedef std::vector<Uniform> UniformArray;
 
+	/// True when `_options.profile` names an eacp profile, which binds resources
+	/// at the eacp renderer's slots instead of bgfx's (see s_profiles).
+	bool isEacpProfile(const Options& _options);
+
 	void printCode(const char* _code, int32_t _line = 0, int32_t _start = 0, int32_t _end = INT32_MAX, int32_t _column = -1);
 	void strReplace(char* _str, const char* _find, const char* _replace);
 	int32_t writef(bx::WriterI* _writer, const char* _format, ...);

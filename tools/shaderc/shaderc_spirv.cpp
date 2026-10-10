@@ -459,6 +459,21 @@ namespace bgfx { namespace spirv
 	/// The value is 100.
 	constexpr int s_GLSL_VULKAN_CLIENT_VERSION = 100;
 
+	// eacp-spirv: the bindings the eacp renderer's one descriptor set uses
+	// (eacp/Lib/eacp/GPU/Codegen/ShaderBindings.h). A render stage's uniform
+	// block is vulkanUniformBinding, textures vulkanTextureBinding(n) and storage
+	// buffers vulkanBufferBinding(n); a kernel's buffers are
+	// vulkanComputeBufferBinding(n), its textures and images
+	// vulkanComputeTextureBinding(n) and its uniform block
+	// vulkanComputeUniformBinding. eacp has no separate sampler descriptors yet
+	// (its textures are COMBINED_IMAGE_SAMPLER), so samplers go above every other
+	// binding, at 32 + n, for the sampler-per-bind work to pick up.
+	constexpr int kEacpSpirvUniformBinding        = 0;
+	constexpr int kEacpSpirvComputeUniformBinding = 16;
+	constexpr int kEacpSpirvTextureBase           = 8;
+	constexpr int kEacpSpirvStorageBufferBase     = 24;
+	constexpr int kEacpSpirvSamplerBase           = 32;
+
 	static bool compile(const Options& _options, uint32_t _version, const std::string& _code, bx::WriterI* _shaderWriter, bx::WriterI* _messageWriter, bool _firstPass)
 	{
 		BX_UNUSED(_version);
@@ -492,12 +507,38 @@ namespace bgfx { namespace spirv
 		shader->setEnvClient(glslang::EShClientVulkan, getGlslangTargetVulkanVersion(_version, _messageWriter));
 		shader->setEnvTarget(glslang::EShTargetSpv, getGlslangTargetSpirvVersion(_version, _messageWriter));
 
-		// Reserve two spots for the stage UBOs
-		shader->setShiftBinding(glslang::EResUbo, (stage == EShLanguage::EShLangFragment ? kSpirvFragmentBinding : kSpirvVertexBinding));
-		shader->setShiftBinding(glslang::EResTexture, kSpirvBindShift);
-		shader->setShiftBinding(glslang::EResSampler, kSpirvBindShift + kSpirvSamplerShift);
-		shader->setShiftBinding(glslang::EResSsbo, kSpirvBindShift);
-		shader->setShiftBinding(glslang::EResImage, kSpirvBindShift);
+		const bool eacp = isEacpProfile(_options);
+		const bool compute = EShLanguage::EShLangCompute == stage;
+
+		// Where a texture's sampler is, relative to the texture.
+		const uint32_t samplerShift = eacp
+			? kEacpSpirvSamplerBase - kEacpSpirvTextureBase
+			: kSpirvSamplerShift
+			;
+
+		// What to subtract from a texture's, image's and storage buffer's
+		// binding to get its stage for the uniform table. Only eacp-spirv
+		// writes the stage; the stock profile writes the binding itself.
+		const uint32_t textureStageShift = eacp ? kEacpSpirvTextureBase : 0;
+		const uint32_t bufferStageShift  = eacp && !compute ? kEacpSpirvStorageBufferBase : 0;
+
+		if (eacp)
+		{
+			shader->setShiftBinding(glslang::EResUbo, compute ? kEacpSpirvComputeUniformBinding : kEacpSpirvUniformBinding);
+			shader->setShiftBinding(glslang::EResTexture, kEacpSpirvTextureBase);
+			shader->setShiftBinding(glslang::EResSampler, kEacpSpirvSamplerBase);
+			shader->setShiftBinding(glslang::EResSsbo, compute ? 0 : kEacpSpirvStorageBufferBase);
+			shader->setShiftBinding(glslang::EResImage, kEacpSpirvTextureBase);
+		}
+		else
+		{
+			// Reserve two spots for the stage UBOs
+			shader->setShiftBinding(glslang::EResUbo, (stage == EShLanguage::EShLangFragment ? kSpirvFragmentBinding : kSpirvVertexBinding));
+			shader->setShiftBinding(glslang::EResTexture, kSpirvBindShift);
+			shader->setShiftBinding(glslang::EResSampler, kSpirvBindShift + kSpirvSamplerShift);
+			shader->setShiftBinding(glslang::EResSsbo, kSpirvBindShift);
+			shader->setShiftBinding(glslang::EResImage, kSpirvBindShift);
+		}
 
 		const char* shaderStrings[] = { _code.c_str() };
 		shader->setStrings(
@@ -790,7 +831,7 @@ namespace bgfx { namespace spirv
 						bool isCompareSampler = false;
 						for (auto& sampler : resourcesrefl.separate_samplers)
 						{
-							if (binding_index + 16 == refl.get_decoration(sampler.id, spv::Decoration::DecorationBinding) )
+							if (binding_index + samplerShift == refl.get_decoration(sampler.id, spv::Decoration::DecorationBinding) )
 							{
 								std::string samplerName = refl.get_name(sampler.id);
 								isCompareSampler = refl.variable_is_depth_or_compare(sampler.id) || samplerName.find("Comparison") != std::string::npos;
@@ -809,7 +850,7 @@ namespace bgfx { namespace spirv
 						un.texDimension = textureDimensionToId(SpirvDimToTextureViewDimension(imageType.dim, imageType.arrayed) );
 						un.texFormat = uint16_t(s_textureFormats[imageType.format]);
 
-						un.regIndex = uint16_t(binding_index);
+						un.regIndex = uint16_t(binding_index - textureStageShift);
 						un.regCount = 0; // unused
 
 						uniforms.push_back(un);
@@ -838,7 +879,7 @@ namespace bgfx { namespace spirv
 						un.texDimension = textureDimensionToId(SpirvDimToTextureViewDimension(imageType.dim, imageType.arrayed) );
 						un.texFormat = uint16_t(s_textureFormats[imageType.format]);
 
-						un.regIndex = uint16_t(binding_index);
+						un.regIndex = uint16_t(binding_index - textureStageShift);
 						un.regCount = descriptorTypeToId(DescriptorType::StorageImage);
 
 						uniforms.push_back(un);
@@ -862,7 +903,7 @@ namespace bgfx { namespace spirv
 						un.name = name;
 						un.type = type;
 						un.num = 0;
-						un.regIndex = uint16_t(binding_index);
+						un.regIndex = uint16_t(binding_index - bufferStageShift);
 						un.regCount = descriptorTypeToId(DescriptorType::StorageBuffer);
 
 						uniforms.push_back(un);
