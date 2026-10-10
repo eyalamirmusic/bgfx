@@ -57,18 +57,17 @@ namespace bgfx { namespace eacp
 			TextureSrgb,        // G4
 			UnknownFormat,      // G4
 			TargetMipChain,     // G6
-			ComputeWriteFormat, // G14
+			ComputeWriteFormat,
 			TextureUpdate,
 			TextureRead,
 			TextureExternal,
 			ClearTexture,
 			BorderColor,
-			ComputeImageFormat, // G14
-			ComputeDepth,       // G39
+			ComputeImageFormat,
+			ComputeReadWrite,
 			ComputeBind,
 			BlitDepth,          // G36
 			BlitLevel,
-			BlitWidened,        // G4
 			BlitVolume,
 			Indirect,
 			Msaa,               // window is sample count 1
@@ -992,17 +991,18 @@ namespace bgfx { namespace eacp
 
 	/// bgfx's texture format as the eacp one, for what eacp has (G4 is the
 	/// rest). A format without one is decoded to BGRA8 when bimg can, which is
-	/// what g_caps' _EMULATED bits (set by bgfx itself) promise. R16F, RG16F,
-	/// R16 and RG32F are stored wider (widenedFormat), as every depth format
-	/// is stored as a 32-bit float plane.
+	/// what g_caps' _EMULATED bits (set by bgfx itself) promise. Every format
+	/// here is stored as itself; only depth is not, every depth format being
+	/// a 32-bit float plane.
 	static bool toEacpFormat(TextureFormat::Enum _format, GPU::TextureFormat& _out)
 	{
 		switch (_format)
 		{
-		case TextureFormat::R16F:    _out = GPU::TextureFormat::R32Float;    return true;
-		case TextureFormat::RG16F:   _out = GPU::TextureFormat::RGBA16Float; return true;
-		case TextureFormat::R16:     _out = GPU::TextureFormat::R32Float;    return true;
-		case TextureFormat::RG32F:   _out = GPU::TextureFormat::RGBA32Float; return true;
+		case TextureFormat::R16F:    _out = GPU::TextureFormat::R16Float;    return true;
+		case TextureFormat::RG16F:   _out = GPU::TextureFormat::RG16Float;   return true;
+		case TextureFormat::R16:     _out = GPU::TextureFormat::R16Unorm;    return true;
+		case TextureFormat::RG32F:   _out = GPU::TextureFormat::RG32Float;   return true;
+		case TextureFormat::R32U:    _out = GPU::TextureFormat::R32Uint;     return true;
 		case TextureFormat::BC1:     _out = GPU::TextureFormat::BC1RGBA;     return true;
 		case TextureFormat::BC2:     _out = GPU::TextureFormat::BC2RGBA;     return true;
 		case TextureFormat::BC3:     _out = GPU::TextureFormat::BC3RGBA;     return true;
@@ -1021,50 +1021,12 @@ namespace bgfx { namespace eacp
 		return false;
 	}
 
-	/// The wider bimg format a bgfx format is stored as, or Count when it is
-	/// stored as itself. eacp has no half-float formats of one or two channels
-	/// (G4), so R16F lives in R32F and RG16F in RGBA16F: a shader samples and
-	/// renders the same values (at more precision for R16F), and CPU data is
-	/// converted on the way in (create, update) and out (readTexture). Only a
-	/// copy between a buffer and such a texture cannot be expressed, the
-	/// bytes being laid out differently.
-	static bimg::TextureFormat::Enum widenedFormat(TextureFormat::Enum _format)
-	{
-		switch (_format)
-		{
-		case TextureFormat::R16F:  return bimg::TextureFormat::R32F;
-		case TextureFormat::RG16F: return bimg::TextureFormat::RGBA16F;
-		// Sampled only: R16's normalized values as floats, and RG32F with
-		// two unused channels (41-tess's height and slope maps, which the
-		// BGRA8 decode clamped and quantised).
-		case TextureFormat::R16:   return bimg::TextureFormat::R32F;
-		case TextureFormat::RG32F: return bimg::TextureFormat::RGBA32F;
-		default:
-			break;
-		}
-
-		return bimg::TextureFormat::Count;
-	}
-
-	/// Whether eacp has a colour attachment format for the texture format:
-	/// RenderPipelineDescriptor::colorFormat (PixelFormat) has no one- or
-	/// two-channel member, so R8 and RG8 cannot be rendered into (G4).
+	/// Whether eacp renders into the texture format: every uncompressed one
+	/// has its PixelFormat (pixelFormatFor), R32Uint as an integer attachment
+	/// that takes no blending.
 	static bool isRenderable(GPU::TextureFormat _format)
 	{
-		switch (_format)
-		{
-		case GPU::TextureFormat::RGBA8Unorm:
-		case GPU::TextureFormat::BGRA8Unorm:
-		case GPU::TextureFormat::RGBA16Float:
-		case GPU::TextureFormat::RGBA32Float:
-		case GPU::TextureFormat::R32Float:
-			return true;
-
-		default:
-			break;
-		}
-
-		return false;
+		return !GPU::isCompressedFormat(_format);
 	}
 
 	/// The sample count of a BGFX_TEXTURE_RT_MSAA_* render target: the count
@@ -1335,19 +1297,18 @@ namespace bgfx { namespace eacp
 
 			// A render target of any kind: a framebuffer attachment names the
 			// level and the layer, face or volume z a pass renders into
-			// (ColorTarget::level, slice, layerCount). A kernel writes a 2D
-			// texture, an array or a volume at any level; not a cube, which
-			// bgfx's kernels declare as a 2D array (IMAGE2D_ARRAY) while eacp
-			// binds the cube's own cube-typed texture, a mismatch Metal's
-			// validation layer stops on (G66).
-			const bool cubeKind = GPU::TextureType::Cube == m_kind || GPU::TextureType::CubeArray == m_kind;
+			// (ColorTarget::level, slice, layerCount). A kernel writes any
+			// kind at any level, a cube or cube array as the 2D array of its
+			// slices, which is how bgfx's kernels declare one (IMAGE2D_ARRAY,
+			// bound through setOutputTextureAsArray), in any format the device
+			// stores to.
 			desc.renderTarget = renderTarget;
-			desc.computeWrite = computeWrite && GPU::supportsComputeWrite(m_format) && !cubeKind;
+			desc.computeWrite = computeWrite && GPU::Device::shared().supportsComputeWrite(m_format);
 
 			if (computeWrite
 			&&  !desc.computeWrite)
 			{
-				traceOnce(Unsupported::ComputeWriteFormat, "G14/G66: a compute-write texture eacp cannot write (format, or a cube as a 2D array) is created read-only.");
+				traceOnce(Unsupported::ComputeWriteFormat, "a compute-write texture in a format the device cannot compute-write (Device::supportsComputeWrite: BGRA8, block formats) is created read-only.");
 			}
 
 			if (desc.renderTarget
@@ -1378,10 +1339,9 @@ namespace bgfx { namespace eacp
 
 			// Every level of every slice the container holds, in the format eacp
 			// stores: straight out of bgfx's memory where the bytes are eacp's,
-			// decoded or widened into a buffer of its own where not. A texture
+			// decoded into a buffer of its own where not. A texture
 			// made with no data (a target, a dynamic texture) names none.
 			const bool convert = m_textureFormat != m_requestedFormat;
-			const bimg::TextureFormat::Enum wide = widenedFormat(m_textureFormat);
 			const uint32_t numSlices = slices();
 
 			std::vector<GPU::TextureSubresource> subresources;
@@ -1389,7 +1349,7 @@ namespace bgfx { namespace eacp
 			std::vector<uint8_t> temp;
 
 			subresources.reserve(numSlices*m_numMips);
-			storage.reserve(convert || bimg::TextureFormat::Count != wide ? numSlices*m_numMips : 0);
+			storage.reserve(convert ? numSlices*m_numMips : 0);
 
 			for (uint32_t slice = 0; slice < numSlices; ++slice)
 			{
@@ -1431,12 +1391,6 @@ namespace bgfx { namespace eacp
 						}
 
 						sub.pixels = dst;
-					}
-					else if (bimg::TextureFormat::Count != wide)
-					{
-						storage.emplace_back(levelBytes(lod)*depth, 0);
-						bimg::imageConvert(g_allocator, storage.back().data(), wide, mip.m_data, bimg::TextureFormat::Enum(m_textureFormat), width, height, depth);
-						sub.pixels = storage.back().data();
 					}
 					else
 					{
@@ -1540,8 +1494,7 @@ namespace bgfx { namespace eacp
 			uint32_t       pitch = srcPitch;
 			std::vector<uint8_t> temp;
 
-			if (m_textureFormat != m_requestedFormat
-			||  bimg::TextureFormat::Count != widenedFormat(m_textureFormat) )
+			if (m_textureFormat != m_requestedFormat)
 			{
 				// bimg decodes and converts from tight rows.
 				std::vector<uint8_t> tight(tightPitch*rows*depth);
@@ -1555,22 +1508,12 @@ namespace bgfx { namespace eacp
 
 				const uint32_t imageBytes = tightPitch*rows;
 
-				if (m_textureFormat != m_requestedFormat)
-				{
-					pitch = _rect.m_width*4;
-					temp.resize(pitch*_rect.m_height*depth);
+				pitch = _rect.m_width*4;
+				temp.resize(pitch*_rect.m_height*depth);
 
-					for (uint32_t zz = 0; zz < depth; ++zz)
-					{
-						bimg::imageDecodeToBgra8(g_allocator, &temp[zz*pitch*_rect.m_height], &tight[zz*imageBytes], _rect.m_width, _rect.m_height, pitch, requested);
-					}
-				}
-				else
+				for (uint32_t zz = 0; zz < depth; ++zz)
 				{
-					// Into the wider format the texture is stored as.
-					pitch = _rect.m_width*uint32_t(GPU::bytesPerPixel(m_format) );
-					temp.resize(pitch*_rect.m_height*depth);
-					bimg::imageConvert(g_allocator, temp.data(), widenedFormat(m_textureFormat), tight.data(), requested, _rect.m_width, _rect.m_height, depth);
+					bimg::imageDecodeToBgra8(g_allocator, &temp[zz*pitch*_rect.m_height], &tight[zz*imageBytes], _rect.m_width, _rect.m_height, pitch, requested);
 				}
 
 				data = temp.data();
@@ -1590,8 +1533,7 @@ namespace bgfx { namespace eacp
 		}
 
 		/// One level of one slice as bgfx lays it out (the first image of a
-		/// volume's level, as renderer_mtl.cpp reads): a widened format is read
-		/// wide and converted back.
+		/// volume's level, as renderer_mtl.cpp reads).
 		void read(void* _data, uint16_t _layer, uint8_t _mip)
 		{
 			if (!m_texture)
@@ -1621,17 +1563,7 @@ namespace bgfx { namespace eacp
 			region.origin = { 0, 0, 0 };
 			region.size   = { int(width), int(height), 1 };
 
-			const bimg::TextureFormat::Enum wide = widenedFormat(m_textureFormat);
-
-			if (bimg::TextureFormat::Count == wide)
-			{
-				m_texture->readSubresource(region, _data);
-				return;
-			}
-
-			std::vector<uint8_t> temp(levelBytes(_mip), 0);
-			m_texture->readSubresource(region, temp.data() );
-			bimg::imageConvert(g_allocator, _data, bimg::TextureFormat::Enum(m_textureFormat), temp.data(), wide, width, height, 1);
+			m_texture->readSubresource(region, _data);
 		}
 
 		std::optional<GPU::Texture> m_texture;
@@ -1888,8 +1820,9 @@ namespace bgfx { namespace eacp
 			g_caps.originBottomLeft = false;
 
 			// IMAGE_RW: a compute-write texture is ShaderRead|ShaderWrite, and
-			// every Apple GPU eacp runs on is read-write tier 2, which reads and
-			// writes RGBA8, RGBA16F and RGBA32F in one kernel.
+			// the device reads and writes some format through one bind
+			// (supportsComputeReadWrite, R32Float on every read-write tier);
+			// which formats is each format's IMAGE_READ (fillFormatCaps).
 			// BLEND_INDEPENDENT: a pipeline blends each of a pass's colour
 			// attachments by its own ColorTargetState (G3).
 			// DRAW_INDIRECT: RenderPass::drawIndirect and drawIndexedIndirect
@@ -1901,7 +1834,7 @@ namespace bgfx { namespace eacp
 			g_caps.supported |= 0
 				| BGFX_CAPS_COMPUTE
 				| BGFX_CAPS_INDEX32
-				| BGFX_CAPS_IMAGE_RW
+				| (device.supportsComputeReadWrite(GPU::TextureFormat::R32Float) ? BGFX_CAPS_IMAGE_RW : 0)
 				| BGFX_CAPS_BLEND_INDEPENDENT
 				| BGFX_CAPS_DRAW_INDIRECT
 				| (device.supportsIndirectCount() ? BGFX_CAPS_DRAW_INDIRECT_COUNT : 0)
@@ -1971,8 +1904,8 @@ namespace bgfx { namespace eacp
 			// as an array where bgfx asks for layers (maxTextureLayers,
 			// BGFX_CAPS_TEXTURE_CUBE_ARRAY), renderable where eacp renders to it. No _SRGB (G4),
 			// _VERTEX where the device samples in the vertex stage (G17), no
-			// _MIP_AUTOGEN (G6), _IMAGE_* only where eacp
-			// makes a compute-write texture (G14). _MSAA and _FRAMEBUFFER_MSAA
+			// _MIP_AUTOGEN (G6), _IMAGE_* as the device answers for kernels
+			// (Device::supportsComputeWrite, supportsComputeReadWrite). _MSAA and _FRAMEBUFFER_MSAA
 			// on what renders, depth included: eacp multisamples a render target
 			// and resolves it (sampleCountFor picks the count the device takes).
 			// bgfx adds _EMULATED to every other format bimg can
@@ -1989,37 +1922,49 @@ namespace bgfx { namespace eacp
 			// eacp refuses a compressed volume.
 			const uint32_t blocks = sampled & ~BGFX_CAPS_FORMAT_TEXTURE_3D;
 
-			g_caps.formats[TextureFormat::BGRA8  ] = renderable | sampled | BGFX_CAPS_FORMAT_TEXTURE_BACKBUFFER;
-			g_caps.formats[TextureFormat::RGBA8  ] = renderable | sampled;
-			g_caps.formats[TextureFormat::R8     ] = renderable | sampled;
-			g_caps.formats[TextureFormat::RG8    ] = renderable | sampled;
-			g_caps.formats[TextureFormat::RGBA16F] = renderable | sampled;
-			g_caps.formats[TextureFormat::RGBA32F] = renderable | sampled;
-			g_caps.formats[TextureFormat::R32F   ] = renderable | sampled;
+			// Every uncompressed format eacp has renders, each in its own
+			// PixelFormat; R32U as an integer attachment, never blended (and
+			// so with no _MSAA resolve to average).
+			static const TextureFormat::Enum s_uncompressed[] =
+			{
+				TextureFormat::BGRA8,
+				TextureFormat::RGBA8,
+				TextureFormat::R8,
+				TextureFormat::RG8,
+				TextureFormat::RGBA16F,
+				TextureFormat::RGBA32F,
+				TextureFormat::R32F,
+				TextureFormat::R16F,
+				TextureFormat::RG16F,
+				TextureFormat::RG32F,
+				TextureFormat::R16,
+				TextureFormat::R32U,
+			};
 
-			// Stored as R32F and RGBA16F (widenedFormat).
-			g_caps.formats[TextureFormat::R16F   ] = renderable | sampled;
-			g_caps.formats[TextureFormat::RG16F  ] = renderable | sampled;
+			for (TextureFormat::Enum format : s_uncompressed)
+			{
+				GPU::TextureFormat eacp;
+				toEacpFormat(format, eacp);
 
-			// Stored as R32F and RGBA32F, sampled only (widenedFormat).
-			g_caps.formats[TextureFormat::R16    ] = sampled;
-			g_caps.formats[TextureFormat::RG32F  ] = sampled;
+				// IMAGE_WRITE where a kernel can store to the format
+				// (Device::supportsComputeWrite: on Metal every uncompressed
+				// format but BGRA8). IMAGE_READ where it can also load through
+				// the bind it writes with (supportsComputeReadWrite: Metal's
+				// read-write tier), so READ|WRITE, the pair bgfx asks for an
+				// IMAGE2D_RW, is a format an access::read_write texture takes;
+				// an IMAGE2D_RO of any writable format reads either way.
+				g_caps.formats[format] = renderable | sampled
+					| (_device.supportsComputeWrite(eacp)     ? BGFX_CAPS_FORMAT_TEXTURE_IMAGE_WRITE : 0)
+					| (_device.supportsComputeReadWrite(eacp) ? BGFX_CAPS_FORMAT_TEXTURE_IMAGE_READ  : 0)
+					;
 
-			// eacp has no attachment format for one or two channels (PixelFormat),
-			// so these sample but are not rendered into (G4).
-			g_caps.formats[TextureFormat::R8     ] = sampled;
-			g_caps.formats[TextureFormat::RG8    ] = sampled;
+				if (GPU::isIntegerFormat(eacp) )
+				{
+					g_caps.formats[format] &= ~(BGFX_CAPS_FORMAT_TEXTURE_MSAA|BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER_MSAA);
+				}
+			}
 
-			// GPU::supportsComputeWrite: the formats D3D12 guarantees a typed
-			// UAV store for, which eacp holds every backend to (G14).
-			const uint32_t image = 0
-				| BGFX_CAPS_FORMAT_TEXTURE_IMAGE_READ
-				| BGFX_CAPS_FORMAT_TEXTURE_IMAGE_WRITE
-				;
-
-			g_caps.formats[TextureFormat::RGBA8  ] |= image;
-			g_caps.formats[TextureFormat::RGBA16F] |= image;
-			g_caps.formats[TextureFormat::RGBA32F] |= image;
+			g_caps.formats[TextureFormat::BGRA8] |= BGFX_CAPS_FORMAT_TEXTURE_BACKBUFFER;
 
 			// Depth: a 32-bit float plane (with 8 bits of stencil for the
 			// formats that have it) on a colour target, rendered into by a
@@ -3263,13 +3208,18 @@ namespace bgfx { namespace eacp
 						// setImage's mip is one level of the texture, every
 						// slice of it (setOutputTextureLevel,
 						// setInputTextureLevel); level 0 is the whole texture's
-						// own bind. An image the kernel would write and eacp
-						// cannot bind for writing (G14 formats, a cube, G66; a
-						// level the texture lacks) leaves the slot to whatever
-						// texture is there, which Metal's validation stops on:
-						// the dispatch is skipped instead (G67).
+						// own bind. A cube or cube array is the 2D array of
+						// its slices at that level (the AsArray binds), as
+						// bgfx's IMAGE2D_ARRAY declares it. An image the kernel
+						// would write and eacp cannot bind for writing (a
+						// format the device does not compute-write, a level
+						// the texture lacks) or read-write through one bind
+						// (Device::supportsComputeReadWrite) leaves the slot to
+						// whatever texture is there, which Metal's validation
+						// stops on: the dispatch is skipped instead (G67).
 						const uint8_t mip   = bind.m_firstMip;
 						const bool    write = Access::Read != bind.m_access;
+						const bool    cube  = GPU::TextureType::Cube == texture.m_kind || GPU::TextureType::CubeArray == texture.m_kind;
 
 						if (!texture.m_texture
 						||  mip >= texture.m_texture->mipLevels() )
@@ -3277,9 +3227,19 @@ namespace bgfx { namespace eacp
 							traceOnce(Unsupported::ComputeBind, "a compute binding of a buffer, texture or mip level that does not exist is left unbound.");
 							unbound |= write;
 						}
+						else if (Access::ReadWrite == bind.m_access
+						     &&  !GPU::Device::shared().supportsComputeReadWrite(texture.m_format) )
+						{
+							traceOnce(Unsupported::ComputeReadWrite, "a kernel reading and writing an image in a format the device cannot read-write through one bind (Device::supportsComputeReadWrite) is not dispatched.");
+							unbound = true;
+						}
 						else if (texture.m_texture->isComputeWritable() )
 						{
-							if (0 == mip)
+							if (cube)
+							{
+								pass.setOutputTextureAsArray(*texture.m_texture, stage, int(mip) );
+							}
+							else if (0 == mip)
 							{
 								pass.setOutputTexture(*texture.m_texture, stage);
 							}
@@ -3293,7 +3253,11 @@ namespace bgfx { namespace eacp
 							// access::read needs only ShaderRead, which every
 							// eacp texture has; the sampler bound beside it is
 							// unused.
-							if (0 == mip)
+							if (cube)
+							{
+								pass.setInputTextureAsArray(*texture.m_texture, stage, int(mip) );
+							}
+							else if (0 == mip)
 							{
 								pass.setInputTexture(*texture.m_texture, stage, getSampler(BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
 							}
@@ -3304,7 +3268,7 @@ namespace bgfx { namespace eacp
 						}
 						else
 						{
-							traceOnce(Unsupported::ComputeImageFormat, "G14/G66: a kernel writing an image eacp cannot compute-write (format, or a cube) is not dispatched.");
+							traceOnce(Unsupported::ComputeImageFormat, "G14: a kernel writing an image the device cannot compute-write (BGRA8, a block format) is not dispatched.");
 							unbound = true;
 						}
 					}
@@ -3320,8 +3284,20 @@ namespace bgfx { namespace eacp
 
 						if (texture->m_depthFormat)
 						{
-							traceOnce(Unsupported::ComputeDepth, "G39: a depth texture sampled by a kernel reads the white fallback (no ComputePass depth texture bind).");
-							texture = NULL;
+							// The depth plane, on whichever target carries
+							// it, as the render stages bind it
+							// (setInputDepthTexture beside
+							// setFragmentDepthTexture).
+							const TextureEacp* carrier = depthCarrier(bind.m_idx);
+
+							if (NULL == carrier)
+							{
+								traceOnce(Unsupported::DepthUnbound, "a depth texture no framebuffer has rendered (or sampled while its target is the open pass) reads a far-plane fallback.");
+								carrier = &m_fallbackDepth;
+							}
+
+							pass.setInputDepthTexture(*carrier->m_texture, stage, getSampler(flags, bind.m_lod.min, bind.m_lod.max) );
+							break;
 						}
 						else if (!texture->m_texture)
 						{
@@ -3732,7 +3708,8 @@ namespace bgfx { namespace eacp
 				writeMask.alpha = 0 != (_state & BGFX_STATE_WRITE_A);
 
 				desc.colorWriteMask = 0 != (_mrtMask & 1) ? writeMask : GPU::ColorWriteMask::none();
-				desc.blend          = translateBlend(_state, _rgba, 0);
+				// An integer attachment (R32U) takes no blending.
+				desc.blend          = GPU::PixelFormat::R32Uint != desc.colorFormat ? translateBlend(_state, _rgba, 0) : std::nullopt;
 
 				// Attachments 1 and up: their own format, bgfx's one write mask,
 				// and the state word's blend or, under
@@ -3741,7 +3718,7 @@ namespace bgfx { namespace eacp
 				{
 					GPU::ColorTargetState target;
 					target.format    = m_target.m_colorFormat[ii];
-					target.blend     = translateBlend(_state, _rgba, ii);
+					target.blend     = GPU::PixelFormat::R32Uint != target.format ? translateBlend(_state, _rgba, ii) : std::nullopt;
 					target.writeMask = 0 != (_mrtMask & (1<<ii) ) ? writeMask : GPU::ColorWriteMask::none();
 					desc.extraColorTargets.push_back(target);
 				}
@@ -4229,9 +4206,8 @@ namespace bgfx { namespace eacp
 		/// textures of a blit have one format, which is what a copy asks, so
 		/// every blit eacp can name is a copy and nothing is drawn: what is
 		/// left out is what eacp cannot hold (a depth texture, G36; a level or
-		/// slice the texture lacks), a volume to or from another kind, more
-		/// than one image between a buffer and a texture, and a buffer copy of
-		/// a widened format, whose bytes differ (G4). A blit of several layers
+		/// slice the texture lacks), a volume to or from another kind, and more
+		/// than one image between a buffer and a texture. A blit of several layers
 		/// is one copy of a run of slices (sliceCount), of a volume's images
 		/// one copy of a box (z and depth).
 		void submitBlit(GPU::Frame& _frame, const BlitItem& _blit)
@@ -4279,12 +4255,6 @@ namespace bgfx { namespace eacp
 				&&  0 != z)
 				{
 					traceOnce(Unsupported::BlitVolume, "a blit between a buffer and a 3D texture's image past the first is skipped (eacp's buffer-texture copies take no z).");
-					return;
-				}
-
-				if (bimg::TextureFormat::Count != widenedFormat(texture.m_textureFormat) )
-				{
-					traceOnce(Unsupported::BlitWidened, "G4: a blit between a buffer and a texture stored wider (R16F, RG16F, R16, RG32F) is skipped.");
 					return;
 				}
 
