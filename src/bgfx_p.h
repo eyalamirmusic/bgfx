@@ -232,6 +232,7 @@ namespace stl = tinystl;
 #define BGFX_RENDERER_NVN_NAME        "NVN"
 #define BGFX_RENDERER_VULKAN_NAME     "Vulkan"
 #define BGFX_RENDERER_WEBGPU_NAME     "WebGPU"
+#define BGFX_RENDERER_EACP_NAME       "Eacp"
 
 #if BGFX_CONFIG_RENDERER_OPENGL
 #	if BGFX_CONFIG_RENDERER_OPENGL == 43

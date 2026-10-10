@@ -13,6 +13,7 @@
 #include "renderer_agc.cpp"
 #include "renderer_d3d11.cpp"
 #include "renderer_d3d12.cpp"
+#include "renderer_eacp.cpp"
 #include "renderer_gl.cpp"
 #include "renderer_gnm.cpp"
 #include "renderer_mtl.cpp"

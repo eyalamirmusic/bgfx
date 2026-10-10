@@ -70,6 +70,7 @@ namespace bgfx
 			OpenGL,     //!< OpenGL 4.3+
 			Vulkan,     //!< Vulkan
 			WebGPU,     //!< WebGPU
+			Eacp,       //!< eacp
 
 			Count
 		};

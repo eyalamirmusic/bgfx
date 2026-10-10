@@ -536,6 +536,7 @@ enum.RendererType { comment = "Renderer types:", section = "Renderer" }
 	.OpenGL     --- OpenGL 4.3+
 	.Vulkan     --- Vulkan
 	.WebGPU     --- WebGPU
+	.Eacp       --- eacp
 	()
 
 --- Access mode enum.

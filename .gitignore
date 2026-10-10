@@ -11,3 +11,6 @@
 .idea
 tags
 *.pyc
+
+# shaderc eacp-* profile output, built by the eacp-bgfx workspace (CMake/EacpShaders.cmake)
+examples/runtime/shaders/eacp-*/

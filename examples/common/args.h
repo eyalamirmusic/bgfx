@@ -21,6 +21,7 @@ struct Args
 		{ '\0', "d3d11", 0, NULL, "Force Direct3D 11 renderer."        },
 		{ '\0', "d3d12", 0, NULL, "Force Direct3D 12 renderer."        },
 		{ '\0', "mtl",   0, NULL, "Force Metal renderer. (macOS only)" },
+		{ '\0', "eacp",  0, NULL, "Force eacp renderer."               },
 	};
 
 	static constexpr bx::CommandLineOption s_vendorOptions[] =
@@ -51,6 +52,10 @@ struct Args
 		else if (cmdLine.hasArg("wgpu") )
 		{
 			m_type = bgfx::RendererType::WebGPU;
+		}
+		else if (cmdLine.hasArg("eacp") )
+		{
+			m_type = bgfx::RendererType::Eacp;
 		}
 		else if (cmdLine.hasArg("noop") )
 		{

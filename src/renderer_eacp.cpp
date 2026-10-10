@@ -1,0 +1,4551 @@
+/*
+ * Copyright 2011-2026 Branimir Karadzic. All rights reserved.
+ * License: https://github.com/bkaradzic/bgfx/blob/master/LICENSE
+ */
+
+#include "bgfx_p.h"
+
+#if BGFX_CONFIG_RENDERER_EACP
+#	include "renderer_eacp.h"
+#	include "renderer.h"
+
+#	include <eacp/GPU/Buffer/StreamingBuffers.h>
+#	include <eacp/GPU/Frame/ComputePass.h>
+#	include <eacp/GPU/Pipeline/ComputePipeline.h>
+#	include <eacp/GPU/Shader/ShaderLibrary.h>
+#	include <eacp/GPU/Texture/Sampler.h>
+#	include <eacp/GPU/Texture/Texture.h>
+
+#	include <bimg/bimg.h>
+
+#	include <atomic>
+#	include <optional>
+#	include <string>
+#	include <unordered_map>
+#	include <vector>
+
+// The eacp backend (plan.md section 4). Gap numbers (Gn) are plan.md section 5's.
+
+namespace bgfx { namespace eacp
+{
+	static GPU::Frame* s_frame;
+	static std::atomic<bool> s_hiDpi;
+
+	GPU::Frame* currentFrame()
+	{
+		return s_frame;
+	}
+
+	/// Things the backend cannot do yet, each reported once.
+	struct Unsupported
+	{
+		enum Enum
+		{
+			CubeRenderTarget,   // G15
+			SwapChain,          // G16
+			FrameBufferColor,   // G3
+			FrameBufferLayer,   // G15
+			FrameBufferFormat,  // G4
+			FrameBufferDepth,
+			DepthUnbound,
+			ScreenShotWindow,   // G34
+			DebugTextTarget,
+			RenderImage,        // G40
+			VertexTexture,      // G17
+			SamplerSlot,        // G17
+			TextureLayers,      // G15
+			TextureSrgb,        // G4
+			UnknownFormat,      // G4
+			CubeMipChain,       // G31
+			TargetMipChain,     // G6
+			ComputeWriteFormat, // G14
+			TextureUpdate,
+			TextureRead,
+			TextureExternal,
+			ClearTexture,
+			BorderColor,
+			ComputeImageMip,    // G15
+			ComputeImageFormat, // G14
+			ComputeDepth,       // G39
+			ComputeBind,
+			Blit,               // G5
+			BlitDraw,           // G5
+			Indirect,           // G8
+			Msaa,               // window is sample count 1
+			BlendIndependent,   // G3
+			BlendFactor,        // G26
+			DepthBias,          // G27
+			Wireframe,          // G28
+			VertexFormat,       // G7
+			UniformBlockSize,   // G9
+			Viewport,           // G30
+
+			Count
+		};
+	};
+
+	static void traceOnce(Unsupported::Enum _what, const char* _message)
+	{
+		static bool s_reported[Unsupported::Count] = {};
+
+		if (!s_reported[_what])
+		{
+			s_reported[_what] = true;
+			BX_TRACE("eacp: %s", _message);
+		}
+
+		BX_UNUSED(_message);
+	}
+
+	static ::eacp::Graphics::Color clearColor(const Clear& _clear, const float _palette[][4])
+	{
+		if (0 != (BGFX_CLEAR_COLOR_USE_PALETTE & _clear.m_flags) )
+		{
+			const uint8_t index = bx::min<uint8_t>(BGFX_CONFIG_MAX_COLOR_PALETTE-1, _clear.m_index[0]);
+			const float* rgba = _palette[index];
+			return { rgba[0], rgba[1], rgba[2], rgba[3] };
+		}
+
+		return
+		{
+			_clear.m_index[0]/255.0f,
+			_clear.m_index[1]/255.0f,
+			_clear.m_index[2]/255.0f,
+			_clear.m_index[3]/255.0f,
+		};
+	}
+
+	static const char* s_attribName[] =
+	{
+		"a_position",
+		"a_normal",
+		"a_tangent",
+		"a_bitangent",
+		"a_color0",
+		"a_color1",
+		"a_color2",
+		"a_color3",
+		"a_indices",
+		"a_weight",
+		"a_texcoord0",
+		"a_texcoord1",
+		"a_texcoord2",
+		"a_texcoord3",
+		"a_texcoord4",
+		"a_texcoord5",
+		"a_texcoord6",
+		"a_texcoord7",
+		"a_texcoord8",
+		"a_texcoord9",
+		"a_texcoord10",
+		"a_texcoord11",
+		"a_texcoord12",
+		"a_texcoord13",
+		"a_texcoord14",
+		"a_texcoord15",
+	};
+	static_assert(Attrib::Count == BX_COUNTOF(s_attribName) );
+
+	static const GPU::CompareFunction s_cmpFunc[] =
+	{
+		GPU::CompareFunction::Always,
+		GPU::CompareFunction::Less,
+		GPU::CompareFunction::LessEqual,
+		GPU::CompareFunction::Equal,
+		GPU::CompareFunction::GreaterEqual,
+		GPU::CompareFunction::Greater,
+		GPU::CompareFunction::NotEqual,
+		GPU::CompareFunction::Never,
+		GPU::CompareFunction::Always,
+	};
+
+	static const GPU::StencilOp s_stencilOp[] =
+	{
+		GPU::StencilOp::Zero,
+		GPU::StencilOp::Keep,
+		GPU::StencilOp::Replace,
+		GPU::StencilOp::IncrementWrap,
+		GPU::StencilOp::IncrementClamp,
+		GPU::StencilOp::DecrementWrap,
+		GPU::StencilOp::DecrementClamp,
+		GPU::StencilOp::Invert,
+	};
+
+	// [factor][0 = colour, 1 = alpha], as renderer_mtl.cpp's s_blendFactor. eacp has
+	// no constant blend colour (G26), so FACTOR and INV_FACTOR stand in as One and
+	// Zero.
+	static const GPU::BlendFactor s_blendFactor[][2] =
+	{
+		{ GPU::BlendFactor::Zero,                     GPU::BlendFactor::Zero                     }, // ignored
+		{ GPU::BlendFactor::Zero,                     GPU::BlendFactor::Zero                     }, // ZERO
+		{ GPU::BlendFactor::One,                      GPU::BlendFactor::One                      }, // ONE
+		{ GPU::BlendFactor::SourceColor,              GPU::BlendFactor::SourceAlpha              }, // SRC_COLOR
+		{ GPU::BlendFactor::OneMinusSourceColor,      GPU::BlendFactor::OneMinusSourceAlpha      }, // INV_SRC_COLOR
+		{ GPU::BlendFactor::SourceAlpha,              GPU::BlendFactor::SourceAlpha              }, // SRC_ALPHA
+		{ GPU::BlendFactor::OneMinusSourceAlpha,      GPU::BlendFactor::OneMinusSourceAlpha      }, // INV_SRC_ALPHA
+		{ GPU::BlendFactor::DestinationAlpha,         GPU::BlendFactor::DestinationAlpha         }, // DST_ALPHA
+		{ GPU::BlendFactor::OneMinusDestinationAlpha, GPU::BlendFactor::OneMinusDestinationAlpha }, // INV_DST_ALPHA
+		{ GPU::BlendFactor::DestinationColor,         GPU::BlendFactor::DestinationAlpha         }, // DST_COLOR
+		{ GPU::BlendFactor::OneMinusDestinationColor, GPU::BlendFactor::OneMinusDestinationAlpha }, // INV_DST_COLOR
+		{ GPU::BlendFactor::SourceAlphaSaturated,     GPU::BlendFactor::One                      }, // SRC_ALPHA_SAT
+		{ GPU::BlendFactor::One,                      GPU::BlendFactor::One                      }, // FACTOR (G26)
+		{ GPU::BlendFactor::Zero,                     GPU::BlendFactor::Zero                     }, // INV_FACTOR (G26)
+	};
+
+	static const GPU::BlendOperation s_blendEquation[] =
+	{
+		GPU::BlendOperation::Add,
+		GPU::BlendOperation::Subtract,
+		GPU::BlendOperation::ReverseSubtract,
+		GPU::BlendOperation::Min,
+		GPU::BlendOperation::Max,
+	};
+
+	struct PrimInfo
+	{
+		GPU::PrimitiveTopology m_type;
+		uint32_t m_min;
+		uint32_t m_div;
+		uint32_t m_sub;
+	};
+
+	static const PrimInfo s_primInfo[] =
+	{
+		{ GPU::PrimitiveTopology::Triangles,     3, 3, 0 },
+		{ GPU::PrimitiveTopology::TriangleStrip, 3, 1, 2 },
+		{ GPU::PrimitiveTopology::Lines,         2, 2, 0 },
+		{ GPU::PrimitiveTopology::LineStrip,     2, 1, 1 },
+		{ GPU::PrimitiveTopology::Points,        1, 1, 0 },
+	};
+	static_assert(Topology::Count == BX_COUNTOF(s_primInfo) );
+
+	// bgfx's attribute type, count and normalisation as the nearest eacp vertex
+	// format. What eacp has: Float x1..4, UByte4Norm, Half2/4, Short2/4Norm, and
+	// no integer format at all. The rest (non-normalised integers, Uint10) is G7.
+	// A non-normalised one is given the normalised format of its size: right for
+	// a shader input declared float (it reads 0..1 rather than 0..255), refused
+	// by Metal when the input is declared integer (uvec4 a_indices), in which
+	// case the pipeline is invalid and its draws are skipped.
+	static GPU::VertexFormat toVertexFormat(uint8_t _num, AttribType::Enum _type, bool _normalized, bool _asInt)
+	{
+		// asInt is ignored, as renderer_mtl.cpp's s_attribType ignores it: bgfx's
+		// meshes pack normals as Uint8 normalized asInt, and the shader unpacks.
+		BX_UNUSED(_asInt);
+
+		switch (_type)
+		{
+		case AttribType::Uint8:
+			if (!_normalized)
+			{
+				traceOnce(Unsupported::VertexFormat, "G7: a non-normalised Uint8 attribute is given UByte4Norm; a float input reads it scaled to 0..1, an integer input (uvec4) fails the pipeline and its draws are skipped.");
+			}
+			return GPU::VertexFormat::UByte4Norm;
+
+		case AttribType::Uint10:
+			traceOnce(Unsupported::VertexFormat, "G7: a Uint10 attribute is given UByte4Norm, which reads the wrong bits.");
+			return GPU::VertexFormat::UByte4Norm;
+
+		case AttribType::Int16:
+			if (!_normalized)
+			{
+				traceOnce(Unsupported::VertexFormat, "G7: a non-normalised Int16 attribute is given ShortNorm; a float input reads it scaled to -1..1, an integer input fails the pipeline and its draws are skipped.");
+			}
+			return _num <= 2 ? GPU::VertexFormat::Short2Norm : GPU::VertexFormat::Short4Norm;
+
+		case AttribType::Half:
+			return _num <= 2 ? GPU::VertexFormat::Half2 : GPU::VertexFormat::Half4;
+
+		case AttribType::Float:
+		default:
+			break;
+		}
+
+		switch (_num)
+		{
+		case 1:  return GPU::VertexFormat::Float;
+		case 2:  return GPU::VertexFormat::Float2;
+		case 3:  return GPU::VertexFormat::Float3;
+		default: return GPU::VertexFormat::Float4;
+		}
+	}
+
+	/// A bgfx vertex or index buffer. Static ones are one device buffer. Dynamic
+	/// ones (bgfx's dynamic and transient buffers, written by update* between
+	/// frames and, for the debug text, between draws of one frame) keep a CPU copy
+	/// and are drawn from a ring of one streaming buffer per frame in flight, so a
+	/// write never lands on bytes a frame still on the GPU reads; a second write
+	/// in a frame that already drew from its slot goes to a StreamingBuffers
+	/// slice instead.
+	///
+	/// A buffer a kernel reads or writes (BGFX_BUFFER_COMPUTE_*, and indirect
+	/// buffers, which kernels fill) is one device buffer of BufferUsage::Storage
+	/// whatever bgfx calls it, static or dynamic: the GPU's writes have to land
+	/// in the bytes the next draw or dispatch reads, which a ring of CPU-filled
+	/// copies cannot give. On Metal any buffer binds as vertex, index or
+	/// storage, so the one buffer serves all three. bgfx refuses CPU updates of
+	/// a COMPUTE_WRITE buffer; a COMPUTE_READ one is updated in place through
+	/// Buffer::update, which orders the write after the frames already
+	/// submitted (it waits for them on Metal).
+	struct BufferEacp
+	{
+		static constexpr int kNumSlots = GPU::StreamingBuffers::framesInFlight;
+
+		BufferEacp(uint32_t _size, const void* _data, uint16_t _flags, bool _vertex, VertexLayoutHandle _layoutHandle)
+			: m_size(_size)
+			, m_flags(_flags)
+			, m_vertex(_vertex)
+			, m_storage(0 != (_flags & (BGFX_BUFFER_COMPUTE_READ_WRITE|BGFX_BUFFER_DRAW_INDIRECT) ) )
+			, m_layoutHandle(_layoutHandle)
+		{
+			const uint32_t bytes = bx::max<uint32_t>(_size, 4);
+
+			if (NULL != _data)
+			{
+				m_static.emplace(GPU::Device::shared().makeBuffer(_data, bytes, usage() ) );
+			}
+			else if (m_storage)
+			{
+				// Zeroed rather than uninitialised: a kernel that accumulates
+				// into it, or an indirect buffer read before it is written, sees
+				// what a fresh buffer on every other bgfx backend holds.
+				const std::vector<uint8_t> zero(bytes, 0);
+				m_static.emplace(GPU::Device::shared().makeBuffer(zero.data(), bytes, usage() ) );
+			}
+			else
+			{
+				m_shadow.resize(bytes, 0);
+			}
+		}
+
+		GPU::BufferUsage usage() const
+		{
+			return m_storage ? GPU::BufferUsage::Storage
+				: m_vertex   ? GPU::BufferUsage::Vertex
+				:              GPU::BufferUsage::Index
+				;
+		}
+
+		void update(uint32_t _offset, uint32_t _size, const void* _data)
+		{
+			if (m_static
+			&&  m_storage)
+			{
+				if (_offset < m_size)
+				{
+					m_static->update(_data, bx::min(_size, m_size - _offset), _offset);
+				}
+
+				return;
+			}
+
+			if (m_static)
+			{
+				BX_TRACE("eacp: update of a static buffer ignored.");
+				return;
+			}
+
+			if (_offset >= m_size)
+			{
+				return;
+			}
+
+			_size = bx::min(_size, m_size - _offset);
+			bx::memCopy(&m_shadow[_offset], _data, _size);
+			m_highWater = bx::max(m_highWater, _offset + _size);
+			++m_version;
+		}
+
+		/// The range a draw in the current frame reads this buffer from.
+		GPU::BufferRange range(GPU::StreamingBuffers& _stream)
+		{
+			if (m_static)
+			{
+				return GPU::BufferRange::of(*m_static);
+			}
+
+			const uint64_t frame = GPU::Device::shared().frameIndex();
+			Slot& slot = m_slots[frame % kNumSlots];
+
+			if (slot.m_buffer
+			&&  slot.m_version == m_version)
+			{
+				slot.m_frame = frame;
+				return GPU::BufferRange::of(*slot.m_buffer);
+			}
+
+			const uint32_t bytes = bx::max<uint32_t>(m_highWater, 4);
+
+			if (slot.m_buffer
+			&&  slot.m_frame == frame)
+			{
+				// Drawn from already in this frame, with the contents before this
+				// write: those draws keep the slot, this one gets a slice.
+				return _stream.write(m_shadow.data(), bytes);
+			}
+
+			if (!slot.m_buffer)
+			{
+				slot.m_buffer.emplace(GPU::Device::shared().makeBuffer(
+					  m_shadow.data()
+					, int64_t(m_shadow.size() )
+					, usage()
+					, GPU::BufferStorage::Streaming
+					) );
+			}
+			else
+			{
+				// The slot was last read by the frame kNumSlots ago, which is no
+				// longer on the GPU: StreamingBuffers' own guarantee.
+				slot.m_buffer->updateUnordered(m_shadow.data(), bytes, 0);
+			}
+
+			slot.m_version = m_version;
+			slot.m_frame   = frame;
+			return GPU::BufferRange::of(*slot.m_buffer);
+		}
+
+		struct Slot
+		{
+			std::optional<GPU::Buffer> m_buffer;
+			uint64_t m_version = UINT64_MAX;
+			uint64_t m_frame   = UINT64_MAX;
+		};
+
+		uint32_t m_size;
+		uint16_t m_flags;
+		bool m_vertex;
+		bool m_storage; // one device buffer kernels read and write
+		VertexLayoutHandle m_layoutHandle;
+
+		std::optional<GPU::Buffer> m_static;
+		std::vector<uint8_t> m_shadow;
+		uint32_t m_highWater = 0;
+		uint64_t m_version   = 0;
+		Slot m_slots[kNumSlots];
+	};
+
+	struct ShaderEacp
+	{
+		ShaderEacp()
+			: m_constantBuffer(NULL)
+			, m_magic(0)
+			, m_hash(0)
+			, m_size(0)
+			, m_numPredefined(0)
+			, m_numSamplers(0)
+			, m_numStorage(0)
+		{
+		}
+
+		~ShaderEacp()
+		{
+			if (NULL != m_constantBuffer)
+			{
+				UniformBuffer::destroy(m_constantBuffer);
+				m_constantBuffer = NULL;
+			}
+		}
+
+		bool create(const Memory* _mem, const UniformRegistry& _uniformReg)
+		{
+			bx::MemoryReader reader(_mem->data, _mem->size);
+
+			bx::Error err;
+
+			bx::read(&reader, m_magic, &err);
+
+			const bool fragment = isShaderType(m_magic, 'F');
+			const uint8_t fragmentBit = fragment ? kUniformFragmentBit : 0;
+
+			uint32_t hashIn;
+			bx::read(&reader, hashIn, &err);
+
+			uint32_t hashOut;
+			bx::read(&reader, hashOut, &err);
+
+			{
+				uint32_t rawSrvMask, rawUavMask;
+				readRawBindings(&reader, rawSrvMask, rawUavMask, &err);
+				BX_UNUSED(rawSrvMask, rawUavMask);
+			}
+
+			uint16_t count = 0;
+			bx::read(&reader, count, &err);
+
+			BX_TRACE("eacp: %s shader, %d uniforms", getShaderTypeName(m_magic), count);
+
+			uint32_t blockSize = 0;
+
+			for (uint32_t ii = 0; ii < count && err.isOk(); ++ii)
+			{
+				uint8_t nameSize = 0;
+				bx::read(&reader, nameSize, &err);
+
+				char name[256];
+				bx::read(&reader, &name, nameSize, &err);
+				name[nameSize] = '\0';
+
+				uint8_t type = 0;
+				bx::read(&reader, type, &err);
+
+				uint8_t num;
+				bx::read(&reader, num, &err);
+
+				uint16_t regIndex;
+				bx::read(&reader, regIndex, &err);
+
+				uint16_t regCount;
+				bx::read(&reader, regCount, &err);
+
+				uint8_t  texComponent;
+				uint8_t  texDimension;
+				uint16_t texFormat;
+				bx::read(&reader, texComponent, &err);
+				bx::read(&reader, texDimension, &err);
+				bx::read(&reader, texFormat, &err);
+				BX_UNUSED(texComponent, texFormat);
+
+				const uint8_t baseType = type & ~kUniformMask;
+				const char* kind = "user";
+
+				if (UniformType::Sampler == baseType
+				||  0 != (type & kUniformSamplerBit) )
+				{
+					// eacp-metal writes the texture index, which is the bind
+					// stage: SAMPLER2D(s_tex, n) declares [[texture(n)]] and
+					// [[sampler(n)]], and setTexture(n, ...) fills m_bind[n].
+					kind = "sampler";
+
+					if (m_numSamplers < BX_COUNTOF(m_samplers) )
+					{
+						m_samplers[m_numSamplers].m_stage     = uint8_t(regIndex);
+						m_samplers[m_numSamplers].m_dimension = texDimension;
+						m_numSamplers++;
+					}
+				}
+				else if (UniformType::End == baseType
+				     &&  (bx::hasSuffix(name, "Texture") || bx::hasSuffix(name, "Sampler") || bx::hasSuffix(name, "SamplerComparison") ) )
+				{
+					// glslang's live uniforms list a sampler's two halves
+					// (s_texTexture, s_texSampler, or s_texSamplerComparison
+					// for a shadow sampler) at offset 0xffff; the Sampler
+					// entry above is the one that matters.
+					kind = "sampler half";
+				}
+				else if (UniformType::End == baseType)
+				{
+					// A storage image or buffer: step 6.
+					kind = "storage";
+					++m_numStorage;
+				}
+				else
+				{
+					// regIndex is the byte offset into the stage's block, as on
+					// Vulkan: shaderc_metal.cpp writes the member's offset.
+					// An array's registers by its element count as well: the
+					// clear quad's bgfx_clear_color[8] is listed with one
+					// register and is 128 bytes in the MSL block.
+					const uint32_t typeRegs = UniformType::Mat4 == baseType ? 4
+						: UniformType::Mat3 == baseType ? 3
+						: 1
+						;
+					blockSize = bx::max<uint32_t>(blockSize, regIndex + bx::max<uint32_t>(regCount, num*typeRegs)*16);
+
+					const PredefinedUniform::Enum predefined = nameToPredefinedUniformEnum(name);
+
+					if (PredefinedUniform::Count != predefined)
+					{
+						kind = "predefined";
+						m_predefined[m_numPredefined].m_loc   = regIndex;
+						m_predefined[m_numPredefined].m_count = regCount;
+						m_predefined[m_numPredefined].m_type  = uint8_t(predefined|fragmentBit);
+						m_numPredefined++;
+					}
+					else if (const UniformRegInfo* info = _uniformReg.find(name) )
+					{
+						if (NULL == m_constantBuffer)
+						{
+							m_constantBuffer = UniformBuffer::create(1024);
+						}
+
+						m_constantBuffer->writeUniformHandle(baseType|fragmentBit, regIndex, info->m_handle, regCount);
+					}
+					else
+					{
+						// The clear quad's own uniforms, which the backend writes
+						// into the block directly.
+						kind = "unregistered";
+					}
+				}
+
+				BX_TRACE("eacp: \t%s: %s (%s), offset %d, regs %d"
+					, kind
+					, name
+					, getUniformTypeName(UniformType::Enum(baseType) )
+					, regIndex
+					, regCount
+					);
+				BX_UNUSED(kind);
+			}
+
+			if (NULL != m_constantBuffer)
+			{
+				m_constantBuffer->finish();
+			}
+
+			if (isShaderType(m_magic, 'C') )
+			{
+				// The kernel's threadgroup, which bgfx's dispatch counts
+				// groups of.
+				bx::read(&reader, m_numThreads, sizeof(m_numThreads), &err);
+			}
+
+			uint32_t shaderSize = 0;
+			bx::read(&reader, shaderSize, &err);
+
+			if (!err.isOk()
+			||  shaderSize > reader.remaining() )
+			{
+				BX_TRACE("eacp: corrupted shader binary.");
+				return false;
+			}
+
+			const char* code = (const char*)reader.getDataPtr();
+			m_code.assign(code, shaderSize);
+			bx::skip(&reader, shaderSize+1);
+
+			uint8_t numAttrs = 0;
+			bx::read(&reader, numAttrs, &err);
+			bx::skip(&reader, numAttrs*sizeof(uint16_t) );
+
+			uint16_t size = 0;
+			bx::read(&reader, size, &err);
+			m_size = bx::max<uint32_t>(bx::max<uint32_t>(size, blockSize), globalBlockSize(m_code) );
+
+			bx::HashMurmur3 murmur;
+			murmur.begin();
+			murmur.add(hashIn);
+			murmur.add(hashOut);
+			murmur.add(code, shaderSize);
+			m_hash = murmur.end();
+
+			return true;
+		}
+
+		/// The size of the MSL `struct _Global`, which the bound bytes must
+		/// cover. The uniform table can say less: it lists the elements a
+		/// shader uses, so fs_clear0's `float4 bgfx_clear_color[8]` is one
+		/// register there and 128 bytes in the block. bgfx's uniforms are
+		/// vec4, mat3 and mat4, each 16-byte aligned.
+		static uint32_t globalBlockSize(const std::string& _msl)
+		{
+			const size_t begin = _msl.find("struct _Global");
+			if (std::string::npos == begin)
+			{
+				return 0;
+			}
+
+			const size_t open  = _msl.find('{', begin);
+			const size_t close = _msl.find('}', begin);
+			if (std::string::npos == open
+			||  std::string::npos == close)
+			{
+				return 0;
+			}
+
+			uint32_t bytes = 0;
+			size_t pos = open + 1;
+
+			while (pos < close)
+			{
+				size_t end = _msl.find(';', pos);
+				if (std::string::npos == end
+				||  end > close)
+				{
+					break;
+				}
+
+				const std::string member = _msl.substr(pos, end-pos);
+				pos = end + 1;
+
+				const uint32_t element = std::string::npos != member.find("float4x4") ? 64
+					: std::string::npos != member.find("float3x3") ? 48
+					: std::string::npos != member.find("float2x2") ? 32
+					: 16
+					;
+
+				uint32_t count = 1;
+				const size_t bracket = member.find('[');
+				if (std::string::npos != bracket)
+				{
+					count = bx::max<uint32_t>(1, uint32_t(atoi(member.c_str() + bracket + 1) ) );
+				}
+
+				bytes += element*count;
+			}
+
+			return bytes;
+		}
+
+		std::string m_code;
+		UniformBuffer* m_constantBuffer;
+		PredefinedUniform m_predefined[PredefinedUniform::Count];
+		uint32_t m_magic;
+		uint32_t m_hash;
+		uint32_t m_size;
+		uint8_t m_numPredefined;
+
+		/// A texture the stage samples: the bind stage (and texture/sampler
+		/// index) and shaderc's TextureDimension id.
+		struct Sampler
+		{
+			uint8_t m_stage;
+			uint8_t m_dimension;
+		};
+
+		Sampler m_samplers[BGFX_CONFIG_MAX_TEXTURE_SAMPLERS];
+		uint8_t m_numSamplers;
+		uint8_t m_numStorage;
+		uint16_t m_numThreads[3] = { 1, 1, 1 };
+	};
+
+	/// Where the vertex stage's [[attribute(n)]] comes from.
+	struct AttributeSource
+	{
+		enum Enum : uint8_t
+		{
+			Vertex,
+			Instance,
+			Unknown,
+		};
+
+		Enum    m_kind  = Unknown;
+		uint8_t m_index = 0; // Attrib::Enum or the i_dataN number
+	};
+
+	static constexpr uint32_t kMaxAttributes = 31;
+
+	struct ProgramEacp
+	{
+		ProgramEacp()
+			: m_vsh(NULL)
+			, m_fsh(NULL)
+			, m_numPredefined(0)
+			, m_numAttributes(0)
+		{
+		}
+
+		static bool isPreamble(const std::string& _line)
+		{
+			return 0 == _line.rfind("#include", 0)
+				|| 0 == _line.rfind("using namespace", 0)
+				;
+		}
+
+		/// G23: one ShaderLibrary per pipeline, and bgfx's two stages are two MSL
+		/// translation units whose names clash (_Global, xlatMtlMain_out). Each
+		/// goes into a namespace of its own, with the includes hoisted out.
+		static std::string programSource(const std::string& _vertex, const std::string& _fragment)
+		{
+			std::string preamble;
+			std::string body[2];
+			const std::string* stage[2] = { &_vertex, &_fragment };
+
+			for (uint32_t ii = 0; ii < 2; ++ii)
+			{
+				size_t pos = 0;
+
+				while (pos < stage[ii]->size() )
+				{
+					size_t end = stage[ii]->find('\n', pos);
+					end = std::string::npos == end ? stage[ii]->size() : end;
+
+					const std::string line = stage[ii]->substr(pos, end-pos) + "\n";
+
+					if (isPreamble(line) )
+					{
+						if (std::string::npos == preamble.find(line) )
+						{
+							preamble += line;
+						}
+					}
+					else
+					{
+						body[ii] += line;
+					}
+
+					pos = end + 1;
+				}
+			}
+
+			return preamble
+				+ "namespace bgfx_vs\n{\n" + body[0] + "} // namespace bgfx_vs\n"
+				+ "namespace bgfx_fs\n{\n" + body[1] + "} // namespace bgfx_fs\n"
+				;
+		}
+
+		/// The vertex inputs as the MSL declares them: `<type> <name>
+		/// [[attribute(<n>)]];` in xlatMtlMain_in. The binary's attribute list says
+		/// the same for vertex attributes, but names every i_dataN 0xffff.
+		void parseAttributes(const std::string& _msl)
+		{
+			m_numAttributes = 0;
+
+			const std::string tag = "[[attribute(";
+			size_t pos = 0;
+
+			while (std::string::npos != (pos = _msl.find(tag, pos) ) )
+			{
+				const uint32_t location = uint32_t(atoi(_msl.c_str() + pos + tag.size() ) );
+
+				size_t nameEnd = pos;
+				while (nameEnd > 0 && ' ' == _msl[nameEnd-1])
+				{
+					--nameEnd;
+				}
+
+				size_t nameBegin = nameEnd;
+				while (nameBegin > 0
+				&&    (bx::isAlphaNum(_msl[nameBegin-1]) || '_' == _msl[nameBegin-1]) )
+				{
+					--nameBegin;
+				}
+
+				pos += tag.size();
+
+				if (location >= kMaxAttributes)
+				{
+					continue;
+				}
+
+				const std::string name = _msl.substr(nameBegin, nameEnd-nameBegin);
+				AttributeSource& source = m_attributes[location];
+				source.m_kind = AttributeSource::Unknown;
+
+				for (uint8_t ii = 0; ii < Attrib::Count; ++ii)
+				{
+					if (name == s_attribName[ii])
+					{
+						source.m_kind  = AttributeSource::Vertex;
+						source.m_index = ii;
+					}
+				}
+
+				if (0 == name.rfind("i_data", 0) )
+				{
+					source.m_kind  = AttributeSource::Instance;
+					source.m_index = uint8_t(atoi(name.c_str() + 6) );
+				}
+
+				m_numAttributes = bx::max<uint32_t>(m_numAttributes, location+1);
+			}
+		}
+
+		bool create(const ShaderEacp* _vsh, const ShaderEacp* _fsh)
+		{
+			m_vsh = _vsh;
+			m_fsh = _fsh;
+
+			bx::memCopy(&m_predefined[0], _vsh->m_predefined, _vsh->m_numPredefined*sizeof(PredefinedUniform) );
+			m_numPredefined = _vsh->m_numPredefined;
+
+			if (NULL != _fsh)
+			{
+				bx::memCopy(&m_predefined[m_numPredefined], _fsh->m_predefined, _fsh->m_numPredefined*sizeof(PredefinedUniform) );
+				m_numPredefined += _fsh->m_numPredefined;
+			}
+
+			if (isShaderType(_vsh->m_magic, 'C') )
+			{
+				return createCompute(*_vsh);
+			}
+
+			if (NULL == _fsh)
+			{
+				BX_TRACE("eacp: a program without a fragment shader is not drawn.");
+				return true;
+			}
+
+			parseAttributes(_vsh->m_code);
+
+			GPU::ShaderSource source = GPU::ShaderSource::msl(programSource(_vsh->m_code, _fsh->m_code) );
+			source.withVertex("bgfx_vs::xlatMtlMain");
+			source.withFragment("bgfx_fs::xlatMtlMain");
+
+			m_library.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+
+			if (!m_library->isValid() )
+			{
+				BX_TRACE("eacp: the program's MSL does not compile.");
+				m_library.reset();
+				return false;
+			}
+
+			return true;
+		}
+
+		/// One stage, so no namespaces: the kernel is the MSL as shaderc wrote
+		/// it, entry xlatMtlMain, with the threadgroup from the binary, which
+		/// eacp's ComputePass dispatches every grid in.
+		bool createCompute(const ShaderEacp& _csh)
+		{
+			GPU::ShaderSource source = GPU::ShaderSource::msl(_csh.m_code);
+			source.withCompute("xlatMtlMain");
+			source.withThreadGroup({ int(_csh.m_numThreads[0]), int(_csh.m_numThreads[1]), int(_csh.m_numThreads[2]) });
+
+			m_library.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+
+			if (!m_library->isValid() )
+			{
+				BX_TRACE("eacp: the kernel's MSL does not compile.");
+				m_library.reset();
+				return false;
+			}
+
+			m_compute.emplace(GPU::Device::shared().makeComputePipeline(*m_library) );
+
+			if (!m_compute->isValid() )
+			{
+				BX_TRACE("eacp: the kernel's pipeline does not build.");
+				m_compute.reset();
+				m_library.reset();
+				return false;
+			}
+
+			BX_TRACE("eacp: kernel, threadgroup %dx%dx%d.", _csh.m_numThreads[0], _csh.m_numThreads[1], _csh.m_numThreads[2]);
+			return true;
+		}
+
+		bool isCompute() const
+		{
+			return m_compute.has_value();
+		}
+
+		bool usesStorage() const
+		{
+			return 0 != m_vsh->m_numStorage
+				|| (NULL != m_fsh && 0 != m_fsh->m_numStorage)
+				;
+		}
+
+		std::optional<GPU::ShaderLibrary> m_library;
+		std::optional<GPU::ComputePipeline> m_compute;
+		const ShaderEacp* m_vsh;
+		const ShaderEacp* m_fsh;
+		PredefinedUniform m_predefined[PredefinedUniform::Count*2];
+		uint8_t m_numPredefined;
+		uint32_t m_numAttributes;
+		AttributeSource m_attributes[kMaxAttributes];
+	};
+
+	/// bgfx's texture format as the eacp one, for what eacp has (G4 is the
+	/// rest). A format without one is decoded to BGRA8 when bimg can, which is
+	/// what g_caps' _EMULATED bits (set by bgfx itself) promise.
+	static bool toEacpFormat(TextureFormat::Enum _format, GPU::TextureFormat& _out)
+	{
+		switch (_format)
+		{
+		case TextureFormat::BC1:     _out = GPU::TextureFormat::BC1RGBA;     return true;
+		case TextureFormat::BC2:     _out = GPU::TextureFormat::BC2RGBA;     return true;
+		case TextureFormat::BC3:     _out = GPU::TextureFormat::BC3RGBA;     return true;
+		case TextureFormat::BC7:     _out = GPU::TextureFormat::BC7RGBA;     return true;
+		case TextureFormat::R8:      _out = GPU::TextureFormat::R8Unorm;     return true;
+		case TextureFormat::RG8:     _out = GPU::TextureFormat::RG8Unorm;    return true;
+		case TextureFormat::BGRA8:   _out = GPU::TextureFormat::BGRA8Unorm;  return true;
+		case TextureFormat::RGBA8:   _out = GPU::TextureFormat::RGBA8Unorm;  return true;
+		case TextureFormat::RGBA16F: _out = GPU::TextureFormat::RGBA16Float; return true;
+		case TextureFormat::RGBA32F: _out = GPU::TextureFormat::RGBA32Float; return true;
+		case TextureFormat::R32F:    _out = GPU::TextureFormat::R32Float;    return true;
+		default:
+			break;
+		}
+
+		return false;
+	}
+
+	/// Whether eacp has a colour attachment format for the texture format:
+	/// RenderPipelineDescriptor::colorFormat (PixelFormat) has no one- or
+	/// two-channel member, so R8 and RG8 cannot be rendered into (G4).
+	static bool isRenderable(GPU::TextureFormat _format)
+	{
+		switch (_format)
+		{
+		case GPU::TextureFormat::RGBA8Unorm:
+		case GPU::TextureFormat::BGRA8Unorm:
+		case GPU::TextureFormat::RGBA16Float:
+		case GPU::TextureFormat::RGBA32Float:
+		case GPU::TextureFormat::R32Float:
+			return true;
+
+		default:
+			break;
+		}
+
+		return false;
+	}
+
+	static uint32_t mipExtent(uint32_t _extent, uint8_t _mip)
+	{
+		return bx::max<uint32_t>(1, _extent >> _mip);
+	}
+
+	/// A bgfx texture: one eacp texture, 2D or cube, plus a CPU copy of every
+	/// level and face for the textures eacp can only replace whole (cubes,
+	/// caller-built mip chains, compressed formats), which updateTexture
+	/// patches and the next submit uploads once.
+	struct TextureEacp
+	{
+		TextureEacp()
+			: m_flags(0)
+			, m_width(0)
+			, m_height(0)
+			, m_numMips(1)
+			, m_numSides(1)
+			, m_shadowMips(1)
+			, m_requestedFormat(TextureFormat::Unknown)
+			, m_textureFormat(TextureFormat::Unknown)
+			, m_format(GPU::TextureFormat::RGBA8Unorm)
+			, m_cube(false)
+			, m_dirty(false)
+			, m_depthFormat(false)
+			, m_stencilFormat(false)
+			, m_depthKept(false)
+			, m_depthOf(kInvalidHandle)
+		{
+		}
+
+		/// The eacp texture a render pass draws into. A depth texture has no eacp
+		/// object of its own; when a framebuffer pairs it with no colour, it
+		/// gets a colour target of its own size to carry its depth plane.
+		bool isTarget() const
+		{
+			return m_texture
+				&& m_texture->isRenderTarget()
+				;
+		}
+
+		/// Recreates the render target with (or without) a depth plane: eacp's
+		/// depth is a property of the colour target, decided when it is made
+		/// (TextureDescriptor::depth), so a framebuffer that pairs a colour
+		/// texture with a depth texture remakes the colour one. Its contents
+		/// are lost, which is nothing for a texture no pass has drawn into yet.
+		bool makeTarget(bool _depth, bool _stencil, bool _sampleable)
+		{
+			GPU::TextureDescriptor desc = m_desc;
+			desc.depth           = _depth || _stencil || _sampleable;
+			desc.stencil         = _stencil;
+			desc.sampleableDepth = _sampleable;
+
+			if (m_texture
+			&&  m_texture->hasDepth()          == desc.depth
+			&&  m_texture->hasStencil()        == desc.stencil
+			&&  m_texture->hasSampleableDepth() == desc.sampleableDepth)
+			{
+				return true;
+			}
+
+			m_texture.emplace(GPU::Device::shared().makeTexture(desc, NULL) );
+			m_depthKept = false;
+
+			if (!m_texture->isValid() )
+			{
+				BX_TRACE("eacp: makeTexture refused the %dx%d render target.", desc.width, desc.height);
+				m_texture.reset();
+				return false;
+			}
+
+			m_desc = desc;
+			return true;
+		}
+
+		uint32_t levelBytes(uint8_t _mip) const
+		{
+			return uint32_t(GPU::levelBytes(m_format, int(mipExtent(m_width, _mip) ), int(mipExtent(m_height, _mip) ) ) );
+		}
+
+		/// Faces in order, each its levels in order: eacp's layout for a cube
+		/// (six faces of one level) and for a chain (one face of N levels).
+		uint32_t imageOffset(uint8_t _side, uint8_t _mip) const
+		{
+			uint32_t faceBytes = 0;
+			uint32_t offset    = 0;
+
+			for (uint8_t mip = 0; mip < m_shadowMips; ++mip)
+			{
+				faceBytes += levelBytes(mip);
+				offset    += mip < _mip ? levelBytes(mip) : 0;
+			}
+
+			return _side*faceBytes + offset;
+		}
+
+		void create(const Memory* _mem, uint64_t _flags, uint8_t _skip)
+		{
+			destroy();
+
+			bimg::ImageContainer imageContainer;
+
+			if (!bimg::imageParse(imageContainer, _mem->data, _mem->size) )
+			{
+				BX_TRACE("eacp: texture data does not parse.");
+				return;
+			}
+
+			const uint8_t startLod = bx::min<uint8_t>(_skip, imageContainer.m_numMips-1);
+
+			bimg::TextureInfo ti;
+			bimg::imageGetSize(
+				  &ti
+				, uint16_t(imageContainer.m_width >>startLod)
+				, uint16_t(imageContainer.m_height>>startLod)
+				, uint16_t(imageContainer.m_depth >>startLod)
+				, imageContainer.m_cubeMap
+				, 1 < imageContainer.m_numMips
+				, imageContainer.m_numLayers
+				, imageContainer.m_format
+				);
+			ti.numMips = bx::min<uint8_t>(imageContainer.m_numMips-startLod, ti.numMips);
+
+			m_flags           = _flags;
+			m_width           = ti.width;
+			m_height          = ti.height;
+			m_numMips         = ti.numMips;
+			m_cube            = imageContainer.m_cubeMap;
+			m_numSides        = m_cube ? 6 : 1;
+			m_requestedFormat = TextureFormat::Enum(imageContainer.m_format);
+			m_textureFormat   = getViableTextureFormat(imageContainer);
+
+			const bool renderTarget = 0 != (_flags & BGFX_TEXTURE_RT_MASK);
+			const bool computeWrite = 0 != (_flags & BGFX_TEXTURE_COMPUTE_WRITE);
+
+			BX_TRACE("eacp: texture %s (requested %s), %dx%d%s, layers %d, mips %d, RT[%c] CW[%c] sRGB[%c]"
+				, getName(m_textureFormat)
+				, getName(m_requestedFormat)
+				, ti.width
+				, ti.height
+				, m_cube ? "x6" : ""
+				, ti.numLayers
+				, ti.numMips
+				, renderTarget ? 'x' : ' '
+				, computeWrite ? 'x' : ' '
+				, 0 != (_flags & BGFX_TEXTURE_SRGB) ? 'x' : ' '
+				);
+
+			if (1 < ti.numLayers
+			||  isVolume(imageContainer) )
+			{
+				traceOnce(Unsupported::TextureLayers, "G15: texture arrays, 3D textures and cube arrays are not created; draws sample the fallback.");
+				return;
+			}
+
+			if (bimg::isDepth(bimg::TextureFormat::Enum(m_textureFormat) ) )
+			{
+				// eacp has no depth texture format (G4): a depth plane is part
+				// of a colour render target. Made at createFrameBuffer, on the
+				// colour texture the framebuffer pairs this with, or on a
+				// colour target of this one's own (a depth-only framebuffer).
+				// Sampled through RenderPass::setFragmentDepthTexture on that
+				// target; always a 32-bit float plane, D24S8 and D0S8 with an
+				// 8-bit stencil beside it.
+				m_depthFormat   = true;
+				m_stencilFormat = 0 < bimg::getBlockInfo(bimg::TextureFormat::Enum(m_textureFormat) ).stencilBits;
+				m_numMips       = 1;
+
+				const uint32_t msaa = uint32_t( (_flags&BGFX_TEXTURE_RT_MSAA_MASK)>>BGFX_TEXTURE_RT_MSAA_SHIFT);
+
+				m_desc = GPU::TextureDescriptor();
+				m_desc.width        = int(m_width);
+				m_desc.height       = int(m_height);
+				m_desc.format       = GPU::TextureFormat::RGBA8Unorm;
+				m_desc.renderTarget = true;
+				m_desc.sampleCount  = 1 < msaa ? int(1 << bx::min<uint32_t>(msaa-1, 3) ) : 1;
+				return;
+			}
+
+			if (!toEacpFormat(m_textureFormat, m_format) )
+			{
+				traceOnce(Unsupported::UnknownFormat, "G4: a texture format with no eacp format and no BGRA8 decode is not created.");
+				return;
+			}
+
+			if (0 != (_flags & BGFX_TEXTURE_SRGB) )
+			{
+				traceOnce(Unsupported::TextureSrgb, "G4: BGFX_TEXTURE_SRGB is sampled as linear (no sRGB formats in eacp).");
+			}
+
+			// BGFX_TEXTURE_BLIT_DST and BGFX_TEXTURE_READ_BACK ask nothing of eacp:
+			// blits are G5 (skipped at the blit) and every texture reads back.
+
+			GPU::TextureDescriptor desc;
+			desc.width  = int(m_width);
+			desc.height = int(m_height);
+			desc.format = m_format;
+			desc.cube   = m_cube;
+
+			// A blit destination with no data of its own is made a render
+			// target, because a blit is a draw into it until eacp has copies
+			// (G5); one bgfx fills from the CPU stays a plain texture.
+			const bool blitTarget = true
+				&& 0 != (_flags & BGFX_TEXTURE_BLIT_DST)
+				&& NULL == imageContainer.m_data
+				&& 1 == ti.numMips
+				&& isRenderable(m_format)
+				;
+
+			// eacp refuses a cube that is rendered into or compute-written (no
+			// way to name the face); such a cube is created as a plain one.
+			desc.renderTarget = (renderTarget || blitTarget) && !m_cube;
+			desc.computeWrite = computeWrite && !m_cube && GPU::supportsComputeWrite(m_format);
+
+			if (computeWrite
+			&&  !desc.computeWrite)
+			{
+				traceOnce(Unsupported::ComputeWriteFormat, "G14/G15: a compute-write texture eacp cannot write (format or cube) is created read-only.");
+			}
+
+			if (renderTarget
+			&&  !desc.renderTarget)
+			{
+				traceOnce(Unsupported::CubeRenderTarget, "G15: a cube render target is created as a plain cube.");
+			}
+
+			if (desc.renderTarget)
+			{
+				const uint32_t msaa = uint32_t( (_flags&BGFX_TEXTURE_RT_MSAA_MASK)>>BGFX_TEXTURE_RT_MSAA_SHIFT);
+				desc.sampleCount = 1 < msaa ? int(1 << bx::min<uint32_t>(msaa-1, 3) ) : 1;
+			}
+
+			const bool compressed = GPU::isCompressedFormat(m_format);
+			const bool gpuWritten = desc.renderTarget || desc.computeWrite;
+
+			if (gpuWritten)
+			{
+				if (1 < m_numMips)
+				{
+					traceOnce(Unsupported::TargetMipChain, "G6: a render target or compute-written texture has one mip level.");
+				}
+
+				m_numMips    = 1;
+				m_shadowMips = 1;
+			}
+			else if (m_cube
+			     &&  1 < m_numMips)
+			{
+				// eacp takes no caller chain on a cube; it builds one per face
+				// from level 0 (uncompressed only).
+				traceOnce(Unsupported::CubeMipChain, "G31: a cube's own mip chain is replaced by eacp's, built from level 0 (none when compressed).");
+				desc.mipmapped = !compressed;
+				m_shadowMips   = 1;
+			}
+			else
+			{
+				desc.mipLevels = 1 < m_numMips ? int(m_numMips) : 0;
+				m_shadowMips   = m_numMips;
+			}
+
+			std::vector<uint8_t> pixels;
+
+			if (!gpuWritten)
+			{
+				pixels.resize(imageOffset(m_numSides, 0), 0);
+
+				const bool convert = m_textureFormat != m_requestedFormat;
+				std::vector<uint8_t> temp;
+
+				for (uint8_t side = 0; side < m_numSides; ++side)
+				{
+					for (uint8_t lod = 0; lod < m_shadowMips; ++lod)
+					{
+						bimg::ImageMip mip;
+
+						if (!bimg::imageGetRawData(imageContainer, side, lod+startLod, _mem->data, _mem->size, mip) )
+						{
+							continue;
+						}
+
+						uint8_t* dst = &pixels[imageOffset(side, lod)];
+
+						if (convert)
+						{
+							// Decoded at bimg's block-aligned size, then the
+							// level's own rows are kept.
+							temp.resize(mip.m_width*mip.m_height*4);
+							bimg::imageDecodeToBgra8(g_allocator, temp.data(), mip.m_data, mip.m_width, mip.m_height, mip.m_width*4, mip.m_format);
+
+							const uint32_t width  = mipExtent(m_width,  lod);
+							const uint32_t height = mipExtent(m_height, lod);
+
+							for (uint32_t yy = 0; yy < height && yy < mip.m_height; ++yy)
+							{
+								bx::memCopy(&dst[yy*width*4], &temp[yy*mip.m_width*4], bx::min(width, mip.m_width)*4);
+							}
+						}
+						else
+						{
+							bx::memCopy(dst, mip.m_data, bx::min(mip.m_size, levelBytes(lod) ) );
+						}
+					}
+				}
+			}
+
+			m_desc = desc;
+			m_texture.emplace(GPU::Device::shared().makeTexture(desc, pixels.empty() ? NULL : pixels.data() ) );
+
+			if (!m_texture->isValid() )
+			{
+				BX_TRACE("eacp: makeTexture refused %dx%d %s.", m_width, m_height, getName(m_textureFormat) );
+				m_texture.reset();
+				return;
+			}
+
+			m_numMips = uint8_t(m_texture->mipLevels() );
+
+			if (!gpuWritten
+			&& (m_cube || 1 < m_shadowMips || compressed) )
+			{
+				m_shadow = std::move(pixels);
+			}
+		}
+
+		void destroy()
+		{
+			m_texture.reset();
+			m_shadow.clear();
+			m_shadow.shrink_to_fit();
+			m_dirty         = false;
+			m_depthFormat   = false;
+			m_stencilFormat = false;
+			m_depthKept     = false;
+			m_depthOf       = kInvalidHandle;
+		}
+
+		void update(uint8_t _side, uint8_t _mip, const Rect& _rect, uint16_t _z, uint16_t _depth, uint16_t _pitch, const Memory* _mem)
+		{
+			if (!m_texture)
+			{
+				return;
+			}
+
+			if (0 != _z
+			||  1 < _depth)
+			{
+				traceOnce(Unsupported::TextureLayers, "G15: an update of a texture layer or 3D slice is skipped.");
+				return;
+			}
+
+			const uint32_t mipWidth  = mipExtent(m_width,  _mip);
+			const uint32_t mipHeight = mipExtent(m_height, _mip);
+
+			if (_side >= m_numSides
+			||  _rect.m_x + _rect.m_width  > mipWidth
+			||  _rect.m_y + _rect.m_height > mipHeight
+			||  0 == _rect.m_width
+			||  0 == _rect.m_height)
+			{
+				return;
+			}
+
+			const bimg::TextureFormat::Enum requested = bimg::TextureFormat::Enum(m_requestedFormat);
+			const bimg::ImageBlockInfo& blockInfo = bimg::getBlockInfo(requested);
+			const bool compressed = bimg::isCompressed(requested);
+
+			const uint32_t tightPitch = compressed
+				? ( (_rect.m_width + blockInfo.blockWidth - 1)/blockInfo.blockWidth)*blockInfo.blockSize
+				: _rect.m_width*blockInfo.bitsPerPixel/8
+				;
+			const uint32_t srcPitch = UINT16_MAX == _pitch ? tightPitch : _pitch;
+			const uint32_t rows     = compressed
+				? (_rect.m_height + blockInfo.blockHeight - 1)/blockInfo.blockHeight
+				: _rect.m_height
+				;
+
+			if (srcPitch*(rows-1) + tightPitch > _mem->size)
+			{
+				return;
+			}
+
+			const uint8_t* data  = _mem->data;
+			uint32_t       pitch = srcPitch;
+			std::vector<uint8_t> temp;
+
+			if (m_textureFormat != m_requestedFormat)
+			{
+				// bimg decodes from tight rows.
+				std::vector<uint8_t> tight(tightPitch*rows);
+				for (uint32_t yy = 0; yy < rows; ++yy)
+				{
+					bx::memCopy(&tight[yy*tightPitch], &data[yy*srcPitch], tightPitch);
+				}
+
+				temp.resize(_rect.m_width*_rect.m_height*4);
+				bimg::imageDecodeToBgra8(g_allocator, temp.data(), tight.data(), _rect.m_width, _rect.m_height, _rect.m_width*4, requested);
+				data  = temp.data();
+				pitch = _rect.m_width*4;
+			}
+
+			if (m_shadow.empty() )
+			{
+				if (0 != _mip)
+				{
+					traceOnce(Unsupported::TextureUpdate, "an update of a mip level eacp built itself is skipped.");
+					return;
+				}
+
+				m_texture->update(
+					  ::eacp::Graphics::Rect(float(_rect.m_x), float(_rect.m_y), float(_rect.m_width), float(_rect.m_height) )
+					, data
+					, int(pitch)
+					);
+				return;
+			}
+
+			if (_mip >= m_shadowMips)
+			{
+				traceOnce(Unsupported::TextureUpdate, "an update of a mip level eacp built itself is skipped.");
+				return;
+			}
+
+			// Into the CPU copy, uploaded whole at the next submit.
+			const bool blocks = GPU::isCompressedFormat(m_format);
+			const uint32_t levelPitch = uint32_t(GPU::levelBytesPerRow(m_format, int(mipWidth) ) );
+			const uint32_t dstX       = blocks ? _rect.m_x/4 * uint32_t(GPU::bytesPerBlock(m_format) ) : _rect.m_x*uint32_t(GPU::bytesPerPixel(m_format) );
+			const uint32_t dstY       = blocks ? _rect.m_y/4 : _rect.m_y;
+			const uint32_t rowBytes   = blocks ? tightPitch  : _rect.m_width*uint32_t(GPU::bytesPerPixel(m_format) );
+			const uint32_t numRows    = blocks ? rows        : _rect.m_height;
+
+			uint8_t* dst = &m_shadow[imageOffset(_side, _mip)];
+
+			for (uint32_t yy = 0; yy < numRows; ++yy)
+			{
+				bx::memCopy(&dst[(dstY+yy)*levelPitch + dstX], &data[yy*pitch], bx::min(rowBytes, levelPitch - dstX) );
+			}
+
+			m_dirty = true;
+		}
+
+		/// The CPU copy to the GPU, when an update changed it.
+		void flush()
+		{
+			if (m_dirty
+			&&  m_texture)
+			{
+				m_texture->update(m_shadow.data() );
+			}
+
+			m_dirty = false;
+		}
+
+		void read(void* _data, uint8_t _mip)
+		{
+			if (!m_texture)
+			{
+				return;
+			}
+
+			flush();
+
+			if (!m_shadow.empty()
+			&& (0 != _mip || m_cube || GPU::isCompressedFormat(m_format) ) )
+			{
+				// What eacp cannot read back (a level below 0, a cube, blocks) is
+				// what was last uploaded, which only the CPU wrote.
+				if (_mip < m_shadowMips)
+				{
+					bx::memCopy(_data, &m_shadow[imageOffset(0, _mip)], levelBytes(_mip) );
+				}
+
+				return;
+			}
+
+			if (0 != _mip
+			||  m_cube)
+			{
+				traceOnce(Unsupported::TextureRead, "readTexture of a level below 0 or of a cube face is not read.");
+				return;
+			}
+
+			m_texture->read(_data);
+		}
+
+		std::optional<GPU::Texture> m_texture;
+		std::vector<uint8_t> m_shadow;
+		uint64_t m_flags;
+		uint32_t m_width;
+		uint32_t m_height;
+		uint8_t  m_numMips;
+		uint8_t  m_numSides;
+		uint8_t  m_shadowMips;
+		TextureFormat::Enum m_requestedFormat;
+		TextureFormat::Enum m_textureFormat;
+		GPU::TextureFormat  m_format;
+		GPU::TextureDescriptor m_desc;
+		bool m_cube;
+		bool m_dirty;
+		bool m_depthFormat;   // a bgfx depth (or stencil) format, no eacp texture of its own
+		bool m_stencilFormat; // ... with a stencil plane
+		bool m_depthKept;     // the depth plane holds what a pass kept (DepthAction::Resume may load it)
+		uint16_t m_depthOf;   // a depth texture: the texture whose target carries its plane
+	};
+
+	/// A bgfx framebuffer of textures: which texture is the colour attachment
+	/// and which the depth. The pass renders into one eacp texture (target),
+	/// the colour attachment's, or for a depth-only framebuffer the depth
+	/// texture's own carrier target.
+	struct FrameBufferEacp
+	{
+		uint16_t m_color  = kInvalidHandle;
+		uint16_t m_depth  = kInvalidHandle;
+		uint16_t m_target = kInvalidHandle;
+		bool m_valid      = false;
+	};
+
+	struct PipelineEacp
+	{
+		std::optional<GPU::RenderPipeline> m_pipeline;
+		uint16_t m_program;
+	};
+
+	/// Makes a pass from inside std::optional::emplace: RenderPass can be neither
+	/// copied nor moved, and Frame::beginPass returns one by value.
+	struct PassMaker
+	{
+		operator GPU::RenderPass() const
+		{
+			return NULL == m_texture
+				? m_frame.beginPass(m_descriptor)
+				: m_frame.beginPass(*m_texture, m_descriptor)
+				;
+		}
+
+		GPU::Frame& m_frame;
+		const GPU::RenderPassDescriptor& m_descriptor;
+		const GPU::Texture* m_texture;
+	};
+
+	/// The same for Frame::beginCompute: ComputePass can be neither copied nor
+	/// moved either. Serial order, so each dispatch sees the writes of the
+	/// ones before it, as bgfx's compute items in sort order expect.
+	struct ComputePassMaker
+	{
+		operator GPU::ComputePass() const
+		{
+			return m_frame.beginCompute(m_label);
+		}
+
+		GPU::Frame& m_frame;
+		const char* m_label;
+	};
+
+	/// A vertex buffer slot of the open pass, by the Metal buffer (or its
+	/// counterpart) and offset it was last bound to.
+	struct BoundStream
+	{
+		/// False when _range is what the slot already holds.
+		bool set(const GPU::BufferRange& _range)
+		{
+			const void* native = NULL != _range.buffer ? _range.buffer->nativeBuffer() : NULL;
+
+			if (native == m_native
+			&&  _range.offset == m_offset)
+			{
+				return false;
+			}
+
+			m_native = native;
+			m_offset = _range.offset;
+			return true;
+		}
+
+		const void* m_native = NULL;
+		int64_t     m_offset = -1;
+	};
+
+	struct RendererContextEacp : public RendererContextI
+	{
+		RendererContextEacp()
+			: m_view(NULL)
+			, m_vertexStream(GPU::BufferUsage::Vertex)
+			, m_indexStream(GPU::BufferUsage::Index)
+		{
+			bx::memSet(m_indexBuffers,  0, sizeof(m_indexBuffers) );
+			bx::memSet(m_vertexBuffers, 0, sizeof(m_vertexBuffers) );
+			bx::memSet(m_shaders,       0, sizeof(m_shaders) );
+			bx::memSet(m_program,       0, sizeof(m_program) );
+		}
+
+		~RendererContextEacp()
+		{
+			m_computePass.reset();
+			m_pass.reset();
+
+			for (auto& pipeline : m_pipelines)
+			{
+				bx::deleteObject(g_allocator, pipeline.second);
+			}
+
+			for (auto& pipeline : m_blitPipelines)
+			{
+				bx::deleteObject(g_allocator, pipeline.second);
+			}
+
+			destroyAll(m_program);
+			destroyAll(m_shaders);
+			destroyAll(m_vertexBuffers);
+			destroyAll(m_indexBuffers);
+		}
+
+		template<typename Ty, size_t NumT>
+		static void destroyAll(Ty* (&_array)[NumT])
+		{
+			for (size_t ii = 0; ii < NumT; ++ii)
+			{
+				if (NULL != _array[ii])
+				{
+					bx::deleteObject(g_allocator, _array[ii]);
+					_array[ii] = NULL;
+				}
+			}
+		}
+
+		template<typename Ty, size_t NumT>
+		static void destroyOne(Ty* (&_array)[NumT], uint16_t _idx)
+		{
+			if (NULL != _array[_idx])
+			{
+				bx::deleteObject(g_allocator, _array[_idx]);
+				_array[_idx] = NULL;
+			}
+		}
+
+		bool init(const Init& _init)
+		{
+			BX_ASSERT(::eacp::Threads::isMainThread()
+				, "The eacp renderer runs on eacp's main thread: call bgfx::renderFrame from there."
+				);
+
+			GPU::Device& device = GPU::Device::shared();
+
+			if (!device.isValid() )
+			{
+				BX_TRACE("eacp: Device::shared() is not valid.");
+				return false;
+			}
+
+			m_view = static_cast<GPU::GPUView*>(_init.swapChain.nwh);
+			s_hiDpi = 0 != (_init.swapChain.flags & BGFX_SWAP_CHAIN_HIDPI);
+
+			g_caps.vendorId = BGFX_PCI_ID_NONE;
+			g_caps.deviceId = 0;
+			g_caps.numGPUs  = 1;
+			g_caps.gpu[0].vendorId = g_caps.vendorId;
+			g_caps.gpu[0].deviceId = g_caps.deviceId;
+
+			g_caps.homogeneousDepth = false;
+			g_caps.originBottomLeft = false;
+
+			// IMAGE_RW: a compute-write texture is ShaderRead|ShaderWrite, and
+			// every Apple GPU eacp runs on is read-write tier 2, which reads and
+			// writes RGBA8, RGBA16F and RGBA32F in one kernel. No DRAW_INDIRECT
+			// (G8): eacp dispatches indirectly but cannot draw indirectly, and
+			// bgfx has one bit for both.
+			g_caps.supported |= 0
+				| BGFX_CAPS_COMPUTE
+				| BGFX_CAPS_INDEX32
+				| BGFX_CAPS_IMAGE_RW
+				;
+
+			fillFormatCaps(device);
+
+			createFallbackTextures();
+
+			// eacp reports no limit; 16384 is what every Metal GPU since the
+			// A8/Mac2 family takes, and D3D12 feature level 11's floor.
+			g_caps.limits.maxTextureSize      = 16384;
+			g_caps.limits.maxTextureLayers    = 1;
+			g_caps.limits.maxFBAttachments    = 1;
+			g_caps.limits.maxTextureSamplers  = bx::min<uint32_t>(g_caps.limits.maxTextureSamplers, 8);
+			g_caps.limits.maxComputeBindings  = bx::min<uint32_t>(BGFX_MAX_COMPUTE_BINDINGS, 8);
+			g_caps.limits.maxVertexStreams    = BGFX_CONFIG_MAX_VERTEX_STREAMS;
+			g_caps.limits.maxVertexAttributes = 16;
+
+			m_perfTrace = NULL != getenv("EACP_BGFX_CAPTURE");
+
+			BX_TRACE("eacp: init on \"%s\", view %p.", device.name().c_str(), m_view);
+
+			return true;
+		}
+
+		static void fillFormatCaps(GPU::Device& _device)
+		{
+			for (uint32_t ii = 0; ii < TextureFormat::Count; ++ii)
+			{
+				g_caps.formats[ii] = BGFX_CAPS_FORMAT_TEXTURE_NONE;
+			}
+
+			const uint32_t renderable = 0
+				| BGFX_CAPS_FORMAT_TEXTURE_2D
+				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER
+				;
+
+			// What toEacpFormat maps: 2D and cube (eacp's two dimensionalities),
+			// renderable where eacp renders to it. No _SRGB (G4), no 3D (G15),
+			// no _VERTEX (G17), no _MIP_AUTOGEN (G6), _IMAGE_* only where eacp
+			// makes a compute-write texture (G14), no _MSAA. bgfx adds _EMULATED to every other format bimg can
+			// decode to BGRA8, and createTexture does that decode.
+			const uint32_t sampled = 0
+				| BGFX_CAPS_FORMAT_TEXTURE_2D
+				| BGFX_CAPS_FORMAT_TEXTURE_CUBE
+				;
+
+			g_caps.formats[TextureFormat::BGRA8  ] = renderable | sampled | BGFX_CAPS_FORMAT_TEXTURE_BACKBUFFER;
+			g_caps.formats[TextureFormat::RGBA8  ] = renderable | sampled;
+			g_caps.formats[TextureFormat::R8     ] = renderable | sampled;
+			g_caps.formats[TextureFormat::RG8    ] = renderable | sampled;
+			g_caps.formats[TextureFormat::RGBA16F] = renderable | sampled;
+			g_caps.formats[TextureFormat::RGBA32F] = renderable | sampled;
+			g_caps.formats[TextureFormat::R32F   ] = renderable | sampled;
+
+			// eacp has no attachment format for one or two channels (PixelFormat),
+			// so these sample but are not rendered into (G4).
+			g_caps.formats[TextureFormat::R8     ] = sampled;
+			g_caps.formats[TextureFormat::RG8    ] = sampled;
+
+			// GPU::supportsComputeWrite: the formats D3D12 guarantees a typed
+			// UAV store for, which eacp holds every backend to (G14).
+			const uint32_t image = 0
+				| BGFX_CAPS_FORMAT_TEXTURE_IMAGE_READ
+				| BGFX_CAPS_FORMAT_TEXTURE_IMAGE_WRITE
+				;
+
+			g_caps.formats[TextureFormat::RGBA8  ] |= image;
+			g_caps.formats[TextureFormat::RGBA16F] |= image;
+			g_caps.formats[TextureFormat::RGBA32F] |= image;
+
+			// Depth: a 32-bit float plane (with 8 bits of stencil for the
+			// formats that have it) on a colour target, rendered into by a
+			// framebuffer and sampled through setFragmentDepthTexture, with or
+			// without a compare sampler. Every depth format is that one plane,
+			// so D16 and D24 are stored at more precision than asked.
+			const uint32_t depth = 0
+				| BGFX_CAPS_FORMAT_TEXTURE_2D
+				| BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER
+				;
+
+			g_caps.formats[TextureFormat::D16  ] = depth;
+			g_caps.formats[TextureFormat::D24  ] = depth;
+			g_caps.formats[TextureFormat::D24S8] = depth;
+			g_caps.formats[TextureFormat::D32  ] = depth;
+			g_caps.formats[TextureFormat::D16F ] = depth;
+			g_caps.formats[TextureFormat::D24F ] = depth;
+			g_caps.formats[TextureFormat::D32F ] = depth;
+			g_caps.formats[TextureFormat::D0S8 ] = BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER;
+
+			if (_device.supportsBlockCompression() )
+			{
+				g_caps.formats[TextureFormat::BC1] = sampled;
+				g_caps.formats[TextureFormat::BC2] = sampled;
+				g_caps.formats[TextureFormat::BC3] = sampled;
+				g_caps.formats[TextureFormat::BC7] = sampled;
+			}
+		}
+
+		/// What a sampler slot reads when the draw binds nothing there, or a
+		/// texture eacp could not create: opaque white, 2D and cube.
+		void createFallbackTextures()
+		{
+			const uint8_t white[6*4] =
+			{
+				0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,
+			};
+
+			for (uint32_t ii = 0; ii < 2; ++ii)
+			{
+				TextureEacp& fallback = m_fallback[ii];
+
+				GPU::TextureDescriptor desc;
+				desc.width  = 1;
+				desc.height = 1;
+				desc.format = GPU::TextureFormat::RGBA8Unorm;
+				desc.cube   = 1 == ii;
+
+				fallback.m_texture.emplace(GPU::Device::shared().makeTexture(desc, white) );
+				fallback.m_cube            = desc.cube;
+				fallback.m_numSides        = desc.cube ? 6 : 1;
+				fallback.m_width           = 1;
+				fallback.m_height          = 1;
+				fallback.m_flags           = BGFX_SAMPLER_POINT;
+				fallback.m_requestedFormat = TextureFormat::RGBA8;
+				fallback.m_textureFormat   = TextureFormat::RGBA8;
+			}
+
+			// A sampleable depth plane at the far plane, for a depth texture
+			// with nothing rendered into it yet: the first submit clears it.
+			GPU::TextureDescriptor desc;
+			desc.width        = 1;
+			desc.height       = 1;
+			desc.format       = GPU::TextureFormat::RGBA8Unorm;
+			desc.renderTarget = true;
+			m_fallbackDepth.m_desc   = desc;
+			m_fallbackDepth.m_width  = 1;
+			m_fallbackDepth.m_height = 1;
+			m_fallbackDepth.makeTarget(true, false, true);
+		}
+
+		RendererType::Enum getRendererType() const override
+		{
+			return RendererType::Eacp;
+		}
+
+		const char* getRendererName() const override
+		{
+			return BGFX_RENDERER_EACP_NAME;
+		}
+
+		bool isDeviceRemoved() override
+		{
+			return false;
+		}
+
+		void flip() override
+		{
+		}
+
+		void createIndexBuffer(IndexBufferHandle _handle, const Memory* _mem, uint16_t _flags) override
+		{
+			destroyOne(m_indexBuffers, _handle.idx);
+			m_indexBuffers[_handle.idx] = BX_NEW(g_allocator, BufferEacp)(_mem->size, _mem->data, _flags, false, VertexLayoutHandle(BGFX_INVALID_HANDLE) );
+		}
+
+		void destroyIndexBuffer(IndexBufferHandle _handle) override
+		{
+			destroyOne(m_indexBuffers, _handle.idx);
+		}
+
+		void createVertexLayout(VertexLayoutHandle _handle, const VertexLayout& _layout) override
+		{
+			bx::memCopy(&m_vertexLayouts[_handle.idx], &_layout, sizeof(VertexLayout) );
+		}
+
+		void destroyVertexLayout(VertexLayoutHandle /*_handle*/) override
+		{
+		}
+
+		void createVertexBuffer(VertexBufferHandle _handle, const Memory* _mem, VertexLayoutHandle _layoutHandle, uint16_t _flags) override
+		{
+			destroyOne(m_vertexBuffers, _handle.idx);
+			m_vertexBuffers[_handle.idx] = BX_NEW(g_allocator, BufferEacp)(_mem->size, _mem->data, _flags, true, _layoutHandle);
+		}
+
+		void destroyVertexBuffer(VertexBufferHandle _handle) override
+		{
+			destroyOne(m_vertexBuffers, _handle.idx);
+		}
+
+		void createDynamicIndexBuffer(IndexBufferHandle _handle, uint32_t _size, uint16_t _flags) override
+		{
+			destroyOne(m_indexBuffers, _handle.idx);
+			m_indexBuffers[_handle.idx] = BX_NEW(g_allocator, BufferEacp)(_size, NULL, _flags, false, VertexLayoutHandle(BGFX_INVALID_HANDLE) );
+		}
+
+		void updateDynamicIndexBuffer(IndexBufferHandle _handle, uint32_t _offset, uint32_t _size, const Memory* _mem) override
+		{
+			if (NULL != m_indexBuffers[_handle.idx])
+			{
+				m_indexBuffers[_handle.idx]->update(_offset, bx::min(_size, _mem->size), _mem->data);
+			}
+		}
+
+		void destroyDynamicIndexBuffer(IndexBufferHandle _handle) override
+		{
+			destroyOne(m_indexBuffers, _handle.idx);
+		}
+
+		void createDynamicVertexBuffer(VertexBufferHandle _handle, uint32_t _size, uint16_t _flags) override
+		{
+			destroyOne(m_vertexBuffers, _handle.idx);
+			m_vertexBuffers[_handle.idx] = BX_NEW(g_allocator, BufferEacp)(_size, NULL, _flags, true, VertexLayoutHandle(BGFX_INVALID_HANDLE) );
+		}
+
+		void updateDynamicVertexBuffer(VertexBufferHandle _handle, uint32_t _offset, uint32_t _size, const Memory* _mem) override
+		{
+			if (NULL != m_vertexBuffers[_handle.idx])
+			{
+				m_vertexBuffers[_handle.idx]->update(_offset, bx::min(_size, _mem->size), _mem->data);
+			}
+		}
+
+		void destroyDynamicVertexBuffer(VertexBufferHandle _handle) override
+		{
+			destroyOne(m_vertexBuffers, _handle.idx);
+		}
+
+		void createShader(ShaderHandle _handle, const Memory* _mem) override
+		{
+			destroyOne(m_shaders, _handle.idx);
+
+			ShaderEacp* shader = BX_NEW(g_allocator, ShaderEacp);
+
+			if (!shader->create(_mem, m_uniformReg) )
+			{
+				bx::deleteObject(g_allocator, shader);
+				return;
+			}
+
+			m_shaders[_handle.idx] = shader;
+		}
+
+		void destroyShader(ShaderHandle _handle) override
+		{
+			destroyOne(m_shaders, _handle.idx);
+		}
+
+		void createProgram(ProgramHandle _handle, ShaderHandle _vsh, ShaderHandle _fsh) override
+		{
+			destroyProgram(_handle);
+
+			const ShaderEacp* vsh = m_shaders[_vsh.idx];
+			const ShaderEacp* fsh = isValid(_fsh) ? m_shaders[_fsh.idx] : NULL;
+
+			if (NULL == vsh)
+			{
+				return;
+			}
+
+			ProgramEacp* program = BX_NEW(g_allocator, ProgramEacp);
+			program->create(vsh, fsh);
+			m_program[_handle.idx] = program;
+		}
+
+		void destroyProgram(ProgramHandle _handle) override
+		{
+			if (NULL == m_program[_handle.idx])
+			{
+				return;
+			}
+
+			for (auto it = m_pipelines.begin(); it != m_pipelines.end(); )
+			{
+				if (it->second->m_program == _handle.idx)
+				{
+					bx::deleteObject(g_allocator, it->second);
+					it = m_pipelines.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+
+			m_lastPipelineKey = 0;
+			m_lastPipeline    = NULL;
+
+			destroyOne(m_program, _handle.idx);
+		}
+
+		void* createTexture(TextureHandle _handle, const Memory* _mem, uint64_t _flags, uint8_t _skip, uint64_t _external) override
+		{
+			if (0 != _external)
+			{
+				traceOnce(Unsupported::TextureExternal, "an external native texture is ignored; bgfx's data is used.");
+			}
+
+			m_textures[_handle.idx].create(_mem, _flags, _skip);
+			return NULL;
+		}
+
+		void updateTexture(TextureHandle _handle, uint8_t _side, uint8_t _mip, const Rect& _rect, uint16_t _z, uint16_t _depth, uint16_t _pitch, const Memory* _mem) override
+		{
+			m_textures[_handle.idx].update(_side, _mip, _rect, _z, _depth, _pitch, _mem);
+		}
+
+		void clearTexture(TextureHandle /*_handle*/, uint8_t /*_mip*/, uint8_t /*_numMips*/, uint16_t /*_layer*/, uint16_t /*_numLayers*/) override
+		{
+			traceOnce(Unsupported::ClearTexture, "clearTexture is not done (no eacp texture clear; a render pass would do it in step 5).");
+		}
+
+		/// Blocking: bgfx reports the data ready two frames on, by which time
+		/// it already is.
+		void readTexture(TextureHandle _handle, void* _data, uint16_t _layer, uint8_t _mip) override
+		{
+			if (0 != _layer)
+			{
+				traceOnce(Unsupported::TextureLayers, "G15: readTexture of a layer other than 0 is not read.");
+				return;
+			}
+
+			TextureEacp& texture = m_textures[_handle.idx];
+
+			if (texture.m_depthFormat)
+			{
+				traceOnce(Unsupported::TextureRead, "readTexture of a depth texture is not read (eacp reads colour only).");
+				return;
+			}
+
+			if (texture.isTarget() )
+			{
+				// What the GPU drew: the frame so far is committed first.
+				if (0 == _mip)
+				{
+					readBack(texture, _data);
+				}
+
+				return;
+			}
+
+			texture.read(_data, _mip);
+		}
+
+		/// Buffer::read of a compute or indirect buffer (bgfx refuses the rest),
+		/// valid once the work that wrote it is committed: inside the frame,
+		/// the frame so far is flushed first, as for readTexture.
+		void readBuffer(Handle _handle, void* _data, uint32_t _offset, uint32_t _size) override
+		{
+			BufferEacp* buffer = NULL;
+
+			if (Handle::IndexBuffer == _handle.type)
+			{
+				buffer = m_indexBuffers[_handle.idx];
+			}
+			else if (Handle::VertexBuffer   == _handle.type
+			     ||  Handle::IndirectBuffer == _handle.type)
+			{
+				buffer = m_vertexBuffers[_handle.idx];
+			}
+
+			if (NULL == buffer
+			||  !buffer->m_static)
+			{
+				return;
+			}
+
+			flushFrame();
+			buffer->m_static->read(_data, _size, _offset);
+		}
+
+		/// As renderer_mtl.cpp: a texture of the new size, recreated from a
+		/// TextureCreate header with no data.
+		void resizeTexture(TextureHandle _handle, uint16_t _width, uint16_t _height, uint8_t _numMips, uint16_t _numLayers) override
+		{
+			TextureEacp& texture = m_textures[_handle.idx];
+
+			const Memory* mem = alloc(sizeof(uint32_t) + sizeof(TextureCreate) );
+
+			bx::StaticMemoryBlockWriter writer(mem->data, mem->size);
+			bx::write(&writer, kChunkMagicTex, bx::ErrorAssert{});
+
+			TextureCreate tc;
+			tc.m_width     = _width;
+			tc.m_height    = _height;
+			tc.m_depth     = 0;
+			tc.m_numLayers = _numLayers;
+			tc.m_numMips   = _numMips;
+			tc.m_format    = texture.m_requestedFormat;
+			tc.m_cubeMap   = false;
+			tc.m_mem       = NULL;
+			bx::write(&writer, tc, bx::ErrorAssert{});
+
+			// A depth plane made by createFrameBuffer goes with the texture to
+			// its new size.
+			const bool depth      = texture.m_texture && texture.m_texture->hasDepth();
+			const bool stencil    = texture.m_texture && texture.m_texture->hasStencil();
+			const bool sampleable = texture.m_texture && texture.m_texture->hasSampleableDepth();
+			const uint16_t depthOf = texture.m_depthOf;
+
+			texture.create(mem, texture.m_flags, 0);
+
+			release(mem);
+
+			if (texture.m_depthFormat)
+			{
+				texture.m_depthOf = depthOf;
+			}
+
+			if (depth
+			&& (texture.isTarget() || texture.m_depthFormat) )
+			{
+				texture.makeTarget(true, stencil, sampleable);
+			}
+		}
+
+		/// No native handle is handed out: eacp's are its own business, and
+		/// overrideInternal has nothing to swap in.
+		uintptr_t getInternal(TextureHandle /*_handle*/) override
+		{
+			return 0;
+		}
+
+		void destroyTexture(TextureHandle _handle) override
+		{
+			m_textures[_handle.idx].destroy();
+		}
+
+		/// A framebuffer of textures. One colour attachment (G3) and one depth
+		/// attachment, mip and layer 0 (G15). The pass renders into the colour
+		/// texture, remade here with a depth plane when the framebuffer has a
+		/// depth attachment; a depth-only framebuffer renders into a colour
+		/// target the depth texture gets for itself. Either way the depth
+		/// texture remembers which target carries its plane, for sampling.
+		void createFrameBuffer(FrameBufferHandle _handle, uint8_t _num, const Attachment* _attachment) override
+		{
+			FrameBufferEacp& fb = m_frameBuffers[_handle.idx];
+			fb = FrameBufferEacp();
+
+			for (uint8_t ii = 0; ii < _num; ++ii)
+			{
+				const Attachment& at = _attachment[ii];
+
+				if (!isValid(at.handle) )
+				{
+					continue;
+				}
+
+				if (0 != at.mip
+				||  0 != at.layer
+				||  1 < at.numLayers)
+				{
+					traceOnce(Unsupported::FrameBufferLayer, "G15: a framebuffer attachment of a mip level or layer other than 0 renders into level 0, layer 0.");
+				}
+
+				if (m_textures[at.handle.idx].m_depthFormat)
+				{
+					fb.m_depth = at.handle.idx;
+				}
+				else if (kInvalidHandle == fb.m_color)
+				{
+					fb.m_color = at.handle.idx;
+				}
+				else
+				{
+					traceOnce(Unsupported::FrameBufferColor, "G3: colour attachments past the first are not rendered into.");
+				}
+			}
+
+			if (kInvalidHandle != fb.m_color)
+			{
+				TextureEacp& color = m_textures[fb.m_color];
+
+				if (!color.isTarget()
+				||  !isRenderable(color.m_format) )
+				{
+					traceOnce(Unsupported::FrameBufferFormat, "G4: a framebuffer whose colour texture eacp cannot render into (R8, RG8, a cube, a refused format) is not drawn.");
+					return;
+				}
+
+				fb.m_target = fb.m_color;
+			}
+			else if (kInvalidHandle != fb.m_depth)
+			{
+				fb.m_target = fb.m_depth;
+			}
+			else
+			{
+				return;
+			}
+
+			if (kInvalidHandle != fb.m_depth)
+			{
+				TextureEacp& depth  = m_textures[fb.m_depth];
+				TextureEacp& target = m_textures[fb.m_target];
+
+				if (kInvalidHandle != depth.m_depthOf
+				&&  depth.m_depthOf != fb.m_target
+				&&  m_textures[depth.m_depthOf].isTarget() )
+				{
+					traceOnce(Unsupported::FrameBufferDepth, "a depth texture shared by framebuffers with different colour textures is a separate plane in each; sampling it reads the latest.");
+				}
+
+				if (fb.m_target == fb.m_depth
+				&&  !target.m_texture)
+				{
+					// The carrier's colour is a dummy nothing reads; RGBA8 at
+					// the depth texture's size.
+					target.m_format = GPU::TextureFormat::RGBA8Unorm;
+				}
+
+				const bool sampleable = 0 == (depth.m_flags & BGFX_TEXTURE_RT_WRITE_ONLY);
+
+				if (!target.makeTarget(true, depth.m_stencilFormat, sampleable) )
+				{
+					return;
+				}
+
+				depth.m_depthOf = fb.m_target;
+			}
+
+			fb.m_valid = true;
+		}
+
+		void createFrameBuffer(FrameBufferHandle _handle, const SwapChain& /*_desc*/) override
+		{
+			traceOnce(Unsupported::SwapChain, "G16: a framebuffer on a second window is not created; its views are skipped.");
+			m_frameBuffers[_handle.idx] = FrameBufferEacp();
+		}
+
+		void destroyFrameBuffer(FrameBufferHandle _handle) override
+		{
+			m_frameBuffers[_handle.idx] = FrameBufferEacp();
+		}
+
+		/// The framebuffer's target texture, or NULL when a view on it cannot
+		/// be drawn.
+		TextureEacp* frameBufferTarget(uint16_t _fbh)
+		{
+			const FrameBufferEacp& fb = m_frameBuffers[_fbh];
+
+			if (!fb.m_valid
+			||  !m_textures[fb.m_target].isTarget() )
+			{
+				return NULL;
+			}
+
+			return &m_textures[fb.m_target];
+		}
+
+		/// Texture::read, valid once the work that drew the texture has been
+		/// committed: inside the frame (bgfx asks for screenshots and reads
+		/// after submit, before the eacp frame ends) the frame is flushed first.
+		void readBack(const TextureEacp& _texture, void* _data)
+		{
+			flushFrame();
+			_texture.m_texture->read(_data);
+		}
+
+		/// Commits what this frame has recorded so far, so a read sees it.
+		void flushFrame()
+		{
+			if (NULL != s_frame
+			&&  m_needFlush)
+			{
+				endPass();
+				s_frame->flush();
+				m_needFlush = false;
+			}
+		}
+
+		/// A screenshot of a texture framebuffer through Texture::read. The
+		/// window's is G34: the drawable is not readable from inside the frame
+		/// (eacp's Frame hands out neither it nor a read of it, and
+		/// View::renderToImage would render the frame again, re-entering
+		/// bgfx::renderFrame).
+		void requestScreenShot(FrameBufferHandle _handle, const char* _filePath) override
+		{
+			if (!isValid(_handle) )
+			{
+				traceOnce(Unsupported::ScreenShotWindow, "G34: a screenshot of the window is not taken (no read of the drawable inside a frame).");
+				return;
+			}
+
+			TextureEacp* target = frameBufferTarget(_handle.idx);
+
+			if (NULL == target
+			||  target->m_depthFormat)
+			{
+				return;
+			}
+
+			const uint32_t width  = target->m_width;
+			const uint32_t height = target->m_height;
+			const uint32_t pitch  = width*uint32_t(GPU::bytesPerPixel(target->m_format) );
+			const uint32_t size   = height*pitch;
+			uint8_t* data = (uint8_t*)bx::alloc(g_allocator, size);
+
+			readBack(*target, data);
+
+			g_callback->screenShot(
+				  _filePath
+				, width
+				, height
+				, pitch
+				, target->m_textureFormat
+				, data
+				, size
+				, false
+				);
+
+			bx::free(g_allocator, data);
+		}
+
+		void invalidateOcclusionQuery(OcclusionQueryHandle /*_handle*/) override
+		{
+		}
+
+		void setMarker(const char* /*_marker*/, uint16_t /*_len*/) override
+		{
+		}
+
+		virtual void setName(Handle /*_handle*/, const char* /*_name*/, uint16_t /*_len*/) override
+		{
+		}
+
+		// ---- uniforms -------------------------------------------------------------
+
+		void setShaderUniform(uint8_t _flags, uint32_t _regIndex, const void* _val, uint32_t _numRegs)
+		{
+			uint8_t* scratch = 0 != (_flags & kUniformFragmentBit) ? m_fsScratch : m_vsScratch;
+
+			if (_regIndex + _numRegs*16 <= sizeof(m_vsScratch) )
+			{
+				bx::memCopy(&scratch[_regIndex], _val, _numRegs*16);
+			}
+		}
+
+		void setShaderUniform4f(uint8_t _flags, uint32_t _regIndex, const void* _val, uint32_t _numRegs)
+		{
+			setShaderUniform(_flags, _regIndex, _val, _numRegs);
+		}
+
+		void setShaderUniform4x4f(uint8_t _flags, uint32_t _regIndex, const void* _val, uint32_t _numRegs)
+		{
+			setShaderUniform(_flags, _regIndex, _val, _numRegs);
+		}
+
+		/// The program's user uniforms from bgfx's per-uniform values into the
+		/// stage blocks, as renderer_vk.cpp's commit.
+		void commit(UniformBuffer& _uniformBuffer)
+		{
+			_uniformBuffer.reset();
+
+			for (;;)
+			{
+				uint32_t opcode = _uniformBuffer.read();
+
+				if (UniformType::End == opcode)
+				{
+					break;
+				}
+
+				uint8_t type;
+				uint16_t loc;
+				uint16_t num;
+				uint16_t copy;
+				UniformBuffer::decodeOpcode(opcode, type, loc, num, copy);
+
+				const char* data;
+				if (copy)
+				{
+					data = _uniformBuffer.read(g_uniformTypeSize[type]*num);
+				}
+				else
+				{
+					UniformHandle handle;
+					bx::memCopy(&handle, _uniformBuffer.read(sizeof(UniformHandle) ), sizeof(UniformHandle) );
+					data = (const char*)m_uniforms[handle.idx];
+				}
+
+				if (NULL == data)
+				{
+					continue;
+				}
+
+				switch (type & ~kUniformFragmentBit)
+				{
+				case UniformType::Mat3:
+					{
+						const float* value = (const float*)data;
+						for (uint32_t ii = 0, count = num/3; ii < count; ++ii, loc += 3*16, value += 9)
+						{
+							Matrix4 mtx;
+							mtx.un.val[ 0] = value[0];
+							mtx.un.val[ 1] = value[1];
+							mtx.un.val[ 2] = value[2];
+							mtx.un.val[ 3] = 0.0f;
+							mtx.un.val[ 4] = value[3];
+							mtx.un.val[ 5] = value[4];
+							mtx.un.val[ 6] = value[5];
+							mtx.un.val[ 7] = 0.0f;
+							mtx.un.val[ 8] = value[6];
+							mtx.un.val[ 9] = value[7];
+							mtx.un.val[10] = value[8];
+							mtx.un.val[11] = 0.0f;
+							setShaderUniform(type, loc, &mtx.un.val[0], 3);
+						}
+					}
+					break;
+
+				case UniformType::Vec4:
+				case UniformType::Mat4:
+					setShaderUniform(type, loc, data, num);
+					break;
+
+				default:
+					break;
+				}
+			}
+		}
+
+		void submitUniformCache(UniformCacheState& _ucs, uint16_t _view)
+		{
+			while (_ucs.hasItem(_view) )
+			{
+				const UniformCacheItem& uci = _ucs.advance();
+
+				bx::memCopy(m_uniforms[uci.m_handle], &_ucs.m_frame->m_uniformCacheFrame.m_data[uci.m_offset], uci.m_size);
+			}
+		}
+
+		static uint32_t blockBytes(const ShaderEacp* _shader)
+		{
+			if (NULL == _shader)
+			{
+				return 0;
+			}
+
+			if (_shader->m_size > 4096)
+			{
+				traceOnce(Unsupported::UniformBlockSize, "G9: a uniform block over 4 KB is clamped to 4 KB.");
+			}
+
+			return bx::min<uint32_t>(_shader->m_size, 4096);
+		}
+
+		void bindUniforms(GPU::RenderPass& _pass, const ProgramEacp& _program)
+		{
+			const uint32_t vsize = blockBytes(_program.m_vsh);
+			const uint32_t fsize = blockBytes(_program.m_fsh);
+
+			if (0 != vsize)
+			{
+				_pass.setVertexBytes(m_vsScratch, int(vsize), 0);
+			}
+
+			if (0 != fsize)
+			{
+				_pass.setFragmentBytes(m_fsScratch, int(fsize), 0);
+			}
+		}
+
+		// ---- textures and samplers ---------------------------------------------------
+
+		/// The palette entry as the nearest of eacp's three border colours, as
+		/// renderer_mtl.cpp's getBorderColor (Metal has the same three).
+		GPU::SamplerBorderColor borderColor(uint32_t _index)
+		{
+			static const float s_borderColor[][4] =
+			{
+				{ 0.0f, 0.0f, 0.0f, 0.0f },
+				{ 0.0f, 0.0f, 0.0f, 1.0f },
+				{ 1.0f, 1.0f, 1.0f, 1.0f },
+			};
+
+			if (NULL == m_colorPalette)
+			{
+				return GPU::SamplerBorderColor::OpaqueBlack;
+			}
+
+			const float* rgba = m_colorPalette[_index];
+
+			uint32_t result = 1;
+			float nearest = bx::kFloatLargest;
+
+			for (uint32_t ii = 0; ii < BX_COUNTOF(s_borderColor); ++ii)
+			{
+				float distSq = 0.0f;
+				for (uint32_t jj = 0; jj < 4; ++jj)
+				{
+					const float diff = rgba[jj] - s_borderColor[ii][jj];
+					distSq += diff*diff;
+				}
+
+				if (distSq < nearest)
+				{
+					nearest = distSq;
+					result  = ii;
+				}
+			}
+
+			if (0.0f != nearest)
+			{
+				traceOnce(Unsupported::BorderColor, "a border colour other than transparent black, opaque black or opaque white is drawn as the nearest of them.");
+			}
+
+			return GPU::SamplerBorderColor(result);
+		}
+
+		/// bgfx's sampler flags as an eacp sampler, cached on the flags, the
+		/// LOD clamp and the border colour the palette resolves to.
+		const GPU::Sampler& getSampler(uint32_t _flags, uint8_t _lodMin, uint8_t _lodMax)
+		{
+			static const GPU::SamplerAddressMode s_addressMode[] =
+			{
+				GPU::SamplerAddressMode::Repeat,
+				GPU::SamplerAddressMode::MirrorRepeat,
+				GPU::SamplerAddressMode::ClampToEdge,
+				GPU::SamplerAddressMode::ClampToBorder,
+			};
+
+			// [MIN|MAG] 0 linear, 1 point, 2 anisotropic (linear with anisotropy).
+			static const GPU::SamplerFilter s_filter[] =
+			{
+				GPU::SamplerFilter::Linear,
+				GPU::SamplerFilter::Nearest,
+				GPU::SamplerFilter::Linear,
+				GPU::SamplerFilter::Linear,
+			};
+
+			const uint32_t index = bx::min<uint32_t>(
+				  BGFX_CONFIG_MAX_COLOR_PALETTE-1
+				, (_flags & BGFX_SAMPLER_BORDER_COLOR_MASK) >> BGFX_SAMPLER_BORDER_COLOR_SHIFT
+				);
+
+			_flags &= BGFX_SAMPLER_BITS_MASK;
+
+			const bool needBorderColor = false
+				|| BGFX_SAMPLER_U_BORDER == (_flags & BGFX_SAMPLER_U_MASK)
+				|| BGFX_SAMPLER_V_BORDER == (_flags & BGFX_SAMPLER_V_MASK)
+				|| BGFX_SAMPLER_W_BORDER == (_flags & BGFX_SAMPLER_W_MASK)
+				;
+
+			const GPU::SamplerBorderColor border = needBorderColor
+				? borderColor(index)
+				: GPU::SamplerBorderColor::TransparentBlack
+				;
+
+			const bool anisotropic = true
+				&& 0 != (m_reset & BGFX_RESET_MAXANISOTROPY)
+				&& 0 != (_flags & (BGFX_SAMPLER_MIN_ANISOTROPIC|BGFX_SAMPLER_MAG_ANISOTROPIC) )
+				;
+
+			const uint64_t key = 0
+				| uint64_t(_flags)
+				| (uint64_t(border)      << 28)
+				| (uint64_t(anisotropic) << 30)
+				| (uint64_t(_lodMax)     << 32)
+				| (uint64_t(_lodMin)     << 40)
+				;
+
+			auto it = m_samplers.find(key);
+
+			if (it == m_samplers.end() )
+			{
+				GPU::SamplerDescriptor desc;
+				desc.addressU      = s_addressMode[(_flags & BGFX_SAMPLER_U_MASK) >> BGFX_SAMPLER_U_SHIFT];
+				desc.addressV      = s_addressMode[(_flags & BGFX_SAMPLER_V_MASK) >> BGFX_SAMPLER_V_SHIFT];
+				desc.addressW      = s_addressMode[(_flags & BGFX_SAMPLER_W_MASK) >> BGFX_SAMPLER_W_SHIFT];
+				desc.minFilter     = s_filter[(_flags & BGFX_SAMPLER_MIN_MASK) >> BGFX_SAMPLER_MIN_SHIFT];
+				desc.magFilter     = s_filter[(_flags & BGFX_SAMPLER_MAG_MASK) >> BGFX_SAMPLER_MAG_SHIFT];
+				desc.mipFilter     = 0 != (_flags & BGFX_SAMPLER_MIP_POINT) ? GPU::SamplerMipFilter::Nearest : GPU::SamplerMipFilter::Linear;
+				desc.maxAnisotropy = anisotropic ? 16 : 1;
+				desc.borderColor   = border;
+				desc.lodMinClamp   = float(_lodMin) * 0.25f;
+				desc.lodMaxClamp   = UINT8_MAX == _lodMax ? bx::kFloatLargest : float(_lodMax) * 0.25f;
+
+				const uint32_t cmpFunc = (_flags & BGFX_SAMPLER_COMPARE_MASK) >> BGFX_SAMPLER_COMPARE_SHIFT;
+				if (0 != cmpFunc)
+				{
+					desc.compare = s_cmpFunc[cmpFunc];
+				}
+
+				it = m_samplers.emplace(key, GPU::Device::shared().makeSampler(desc) ).first;
+			}
+
+			return it->second;
+		}
+
+		/// Every texture the fragment stage declares, from the draw's binding
+		/// at that stage, or the fallback when the draw has none there or its
+		/// texture could not be made (or is the wrong dimension).
+		void bindTextures(GPU::RenderPass& _pass, const ShaderEacp& _fsh, const RenderBind& _renderBind)
+		{
+			for (uint8_t ii = 0; ii < _fsh.m_numSamplers; ++ii)
+			{
+				const ShaderEacp::Sampler& slot = _fsh.m_samplers[ii];
+
+				if (slot.m_stage >= g_caps.limits.maxTextureSamplers)
+				{
+					traceOnce(Unsupported::SamplerSlot, "G17: a texture past eacp's 8 slots is not bound.");
+					continue;
+				}
+
+				const bool cube = 0x04 == slot.m_dimension; // TextureDimension::DimensionCube
+				const Binding& bind = _renderBind.m_bind[slot.m_stage];
+
+				const TextureEacp* texture = NULL;
+				uint32_t flags = 0;
+				uint8_t lodMin = 0;
+				uint8_t lodMax = UINT8_MAX;
+
+				if (kInvalidHandle != bind.m_idx
+				&&  Binding::Texture == bind.m_type)
+				{
+					texture = &m_textures[bind.m_idx];
+					flags   = 0 == (BGFX_SAMPLER_INTERNAL_DEFAULT & bind.m_samplerFlags)
+						? bind.m_samplerFlags
+						: uint32_t(texture->m_flags)
+						;
+					lodMin = bind.m_lod.min;
+					lodMax = bind.m_lod.max;
+
+					if (texture->m_depthFormat)
+					{
+						// The depth plane, on whichever target carries it.
+						const TextureEacp* carrier = depthCarrier(bind.m_idx);
+
+						if (NULL == carrier)
+						{
+							traceOnce(Unsupported::DepthUnbound, "a depth texture no framebuffer has rendered (or sampled while its target is the open pass) reads a far-plane fallback.");
+							carrier = &m_fallbackDepth;
+						}
+
+						_pass.setFragmentDepthTexture(*carrier->m_texture, slot.m_stage, getSampler(flags, lodMin, lodMax) );
+						continue;
+					}
+					else if (!texture->m_texture
+					     ||  texture->m_cube != cube
+					     ||  bind.m_idx == m_passTexture)
+					{
+						texture = NULL;
+					}
+				}
+
+				if (NULL == texture)
+				{
+					texture = &m_fallback[cube ? 1 : 0];
+					flags   = uint32_t(texture->m_flags);
+				}
+
+				_pass.setFragmentTexture(*texture->m_texture, slot.m_stage, getSampler(flags, lodMin, lodMax) );
+			}
+		}
+
+		/// The target whose depth plane a depth texture is, when it can be
+		/// sampled: made sampleable, and not the target of the open pass.
+		const TextureEacp* depthCarrier(uint16_t _depth) const
+		{
+			const uint16_t idx = m_textures[_depth].m_depthOf;
+
+			if (kInvalidHandle == idx
+			||  idx == m_passTexture)
+			{
+				return NULL;
+			}
+
+			const TextureEacp& carrier = m_textures[idx];
+
+			if (!carrier.isTarget()
+			||  !carrier.m_texture->hasSampleableDepth() )
+			{
+				return NULL;
+			}
+
+			return &carrier;
+		}
+
+		// ---- compute -------------------------------------------------------------
+
+		/// A storage binding's buffer from its byte offset: the device buffer of a
+		/// compute buffer, or this frame's copy of any other.
+		GPU::BufferRange storageRange(const Binding& _bind)
+		{
+			BufferEacp* buffer = Binding::IndexBuffer == _bind.m_type
+				? m_indexBuffers[_bind.m_idx]
+				: m_vertexBuffers[_bind.m_idx]
+				;
+
+			if (NULL == buffer)
+			{
+				return {};
+			}
+
+			GPU::BufferRange range = buffer->range(buffer->m_vertex ? m_vertexStream : m_indexStream);
+			const uint32_t offset = bx::min(_bind.m_offset, buffer->m_size);
+			range.offset += offset;
+			range.bytes   = bx::max<int64_t>(range.bytes - offset, 0);
+			return range;
+		}
+
+		static bool hasImageBinding(const RenderBind& _renderBind)
+		{
+			for (uint32_t stage = 0; stage < BGFX_CONFIG_MAX_TEXTURE_SAMPLERS; ++stage)
+			{
+				const Binding& bind = _renderBind.m_bind[stage];
+
+				if (kInvalidHandle != bind.m_idx
+				&&  Binding::Image == bind.m_type)
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		/// A render stage's storage buffers: eacp-metal declares stage n at
+		/// buffer(24 + n) in both stages, RenderPass::bufferBase, which is where
+		/// setVertexStorageBuffer and setFragmentStorageBuffer bind slot n.
+		void bindRenderStorage(GPU::RenderPass& _pass, const RenderBind& _renderBind)
+		{
+			for (uint8_t stage = 0; stage < g_caps.limits.maxComputeBindings; ++stage)
+			{
+				const Binding& bind = _renderBind.m_bind[stage];
+
+				if (kInvalidHandle == bind.m_idx
+				|| (Binding::IndexBuffer  != bind.m_type
+				&&  Binding::VertexBuffer != bind.m_type) )
+				{
+					continue;
+				}
+
+				const GPU::BufferRange range = storageRange(bind);
+
+				if (range.isValid() )
+				{
+					_pass.setVertexStorageBuffer(range, stage);
+					_pass.setFragmentStorageBuffer(range, stage);
+				}
+			}
+		}
+
+		/// One RenderCompute item: into the view's open compute pass (a render
+		/// pass ends first), the kernel, its uniform block at buffer(16)
+		/// (ComputePass::setBytes slot 0, where eacp-metal puts _mtl_u), and
+		/// bgfx's bind stages as eacp-metal numbers them: a buffer at
+		/// buffer(stage), an image or a texture at texture(stage), a texture's
+		/// sampler at sampler(stage). bgfx dispatches threadgroups and eacp
+		/// threads, so the grid is the group count times the kernel's group.
+		void submitCompute(GPU::Frame& _frame, ViewState& _viewState, uint16_t _view, const View& _renderView, const char* _viewName, const RenderCompute& _compute, ProgramHandle _program, Frame* _render)
+		{
+			ProgramEacp* program = isValid(_program) ? m_program[_program.idx] : NULL;
+
+			if (NULL == program
+			||  !program->isCompute() )
+			{
+				return;
+			}
+
+			if (!m_computePass)
+			{
+				m_pass.reset();
+				m_passTexture = kInvalidHandle;
+				m_computePass.emplace(ComputePassMaker{ _frame, _viewName });
+				m_needFlush = true;
+			}
+
+			GPU::ComputePass& pass = *m_computePass;
+			pass.setPipeline(*program->m_compute);
+
+			rendererUpdateUniforms(this, _render->m_uniformBuffer[_compute.m_uniformIdx], _compute.m_uniformBegin, _compute.m_uniformEnd);
+
+			if (NULL != program->m_vsh->m_constantBuffer)
+			{
+				commit(*program->m_vsh->m_constantBuffer);
+			}
+
+			_viewState.setPredefined<4>(this, _view, _renderView, *program, _render, _compute);
+
+			const uint32_t size = blockBytes(program->m_vsh);
+
+			if (0 != size)
+			{
+				pass.setBytes(m_vsScratch, int64_t(size), 0);
+			}
+
+			const RenderBind& renderBind = _render->m_renderBind[_compute.m_bindIdx];
+
+			for (uint8_t stage = 0; stage < g_caps.limits.maxComputeBindings; ++stage)
+			{
+				const Binding& bind = renderBind.m_bind[stage];
+
+				if (kInvalidHandle == bind.m_idx)
+				{
+					continue;
+				}
+
+				switch (bind.m_type)
+				{
+				case Binding::IndexBuffer:
+				case Binding::VertexBuffer:
+					{
+						const GPU::BufferRange range = storageRange(bind);
+
+						if (!range.isValid() )
+						{
+							traceOnce(Unsupported::ComputeBind, "a compute binding of a buffer or texture that does not exist is left unbound.");
+						}
+						else if (Access::Read == bind.m_access)
+						{
+							pass.setInputBuffer(range, stage);
+						}
+						else
+						{
+							pass.setOutputBuffer(range, stage);
+						}
+					}
+					break;
+
+				case Binding::Image:
+					{
+						const TextureEacp& texture = m_textures[bind.m_idx];
+
+						if (!texture.m_texture)
+						{
+							traceOnce(Unsupported::ComputeBind, "a compute binding of a buffer or texture that does not exist is left unbound.");
+						}
+						else if (0 != bind.m_firstMip)
+						{
+							traceOnce(Unsupported::ComputeImageMip, "G15: a storage image of a mip level other than 0 is left unbound (eacp has no level views).");
+						}
+						else if (texture.m_texture->isComputeWritable() )
+						{
+							pass.setOutputTexture(*texture.m_texture, stage);
+						}
+						else if (Access::Read == bind.m_access)
+						{
+							// access::read needs only ShaderRead, which every
+							// eacp texture has; the sampler bound beside it is
+							// unused.
+							pass.setInputTexture(*texture.m_texture, stage, getSampler(BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
+						}
+						else
+						{
+							traceOnce(Unsupported::ComputeImageFormat, "G14: a storage image written in a format eacp cannot compute-write is left unbound.");
+						}
+					}
+					break;
+
+				case Binding::Texture:
+					{
+						const TextureEacp* texture = &m_textures[bind.m_idx];
+						uint32_t flags = 0 == (BGFX_SAMPLER_INTERNAL_DEFAULT & bind.m_samplerFlags)
+							? bind.m_samplerFlags
+							: uint32_t(texture->m_flags)
+							;
+
+						if (texture->m_depthFormat)
+						{
+							traceOnce(Unsupported::ComputeDepth, "G39: a depth texture sampled by a kernel reads the white fallback (no ComputePass depth texture bind).");
+							texture = NULL;
+						}
+						else if (!texture->m_texture)
+						{
+							texture = NULL;
+						}
+
+						if (NULL == texture)
+						{
+							texture = &m_fallback[0];
+							flags   = uint32_t(texture->m_flags);
+						}
+
+						pass.setInputTexture(*texture->m_texture, stage, getSampler(flags, bind.m_lod.min, bind.m_lod.max) );
+					}
+					break;
+
+				default:
+					break;
+				}
+			}
+
+			if (isValid(_compute.m_indirectBuffer) )
+			{
+				// bgfx's indirect dispatch arguments are three uint32 group
+				// counts every BGFX_CONFIG_DRAW_INDIRECT_STRIDE bytes, which is
+				// eacp's DispatchArguments at an offset.
+				BufferEacp* args = m_vertexBuffers[_compute.m_indirectBuffer.idx];
+
+				if (NULL == args
+				||  !args->m_static)
+				{
+					return;
+				}
+
+				const uint32_t numIndirect = UINT32_MAX == _compute.m_numIndirect
+					? args->m_size/BGFX_CONFIG_DRAW_INDIRECT_STRIDE
+					: _compute.m_numIndirect
+					;
+
+				uint32_t offset = _compute.m_startIndirect*BGFX_CONFIG_DRAW_INDIRECT_STRIDE;
+
+				for (uint32_t ii = 0; ii < numIndirect; ++ii, offset += BGFX_CONFIG_DRAW_INDIRECT_STRIDE)
+				{
+					pass.dispatchIndirect(*args->m_static, int64_t(offset) );
+				}
+
+				return;
+			}
+
+			const uint16_t* group = program->m_vsh->m_numThreads;
+
+			if (0 != _compute.m_numX
+			&&  0 != _compute.m_numY
+			&&  0 != _compute.m_numZ)
+			{
+				pass.dispatch(
+					  int(_compute.m_numX*group[0])
+					, int(_compute.m_numY*group[1])
+					, int(_compute.m_numZ*group[2])
+					);
+			}
+		}
+
+		// ---- pipelines -----------------------------------------------------------
+
+		static constexpr uint64_t kPipelineStateMask = 0
+			| BGFX_STATE_WRITE_RGB
+			| BGFX_STATE_WRITE_A
+			| BGFX_STATE_WRITE_Z
+			| BGFX_STATE_DEPTH_TEST_MASK
+			| BGFX_STATE_BLEND_MASK
+			| BGFX_STATE_BLEND_EQUATION_MASK
+			| BGFX_STATE_BLEND_INDEPENDENT
+			| BGFX_STATE_CULL_MASK
+			| BGFX_STATE_FRONT_CCW
+			| BGFX_STATE_PT_MASK
+			;
+
+		bool windowHasDepth() const
+		{
+			return NULL == m_view || m_view->hasDepth();
+		}
+
+		bool windowHasStencil() const
+		{
+			return NULL != m_view && m_view->hasStencil();
+		}
+
+		int windowSampleCount() const
+		{
+			return NULL == m_view ? 1 : m_view->sampleCount();
+		}
+
+		/// What the open pass renders into, which a pipeline has to agree with:
+		/// colour format, sample count, and whether there is a depth and a
+		/// stencil plane.
+		struct Target
+		{
+			GPU::PixelFormat m_colorFormat = GPU::PixelFormat::BGRA8Unorm;
+			int  m_sampleCount = 1;
+			bool m_depth       = true;
+			bool m_stencil     = false;
+		};
+
+		Target windowTarget() const
+		{
+			Target target;
+			target.m_colorFormat = GPU::PixelFormat::BGRA8Unorm;
+			target.m_sampleCount = windowSampleCount();
+			target.m_depth       = windowHasDepth();
+			target.m_stencil     = windowHasStencil();
+			return target;
+		}
+
+		static Target textureTarget(const TextureEacp& _texture)
+		{
+			Target target;
+			target.m_colorFormat = GPU::pixelFormatFor(_texture.m_format);
+			target.m_sampleCount = _texture.m_texture->sampleCount();
+			target.m_depth       = _texture.m_texture->hasDepth();
+			target.m_stencil     = _texture.m_texture->hasStencil();
+			return target;
+		}
+
+		static void translateStencil(GPU::StencilFace& _face, uint32_t _stencil)
+		{
+			_face.compare     = s_cmpFunc[(_stencil&BGFX_STENCIL_TEST_MASK)>>BGFX_STENCIL_TEST_SHIFT];
+			_face.stencilFail = s_stencilOp[(_stencil&BGFX_STENCIL_OP_FAIL_S_MASK)>>BGFX_STENCIL_OP_FAIL_S_SHIFT];
+			_face.depthFail   = s_stencilOp[(_stencil&BGFX_STENCIL_OP_FAIL_Z_MASK)>>BGFX_STENCIL_OP_FAIL_Z_SHIFT];
+			_face.pass        = s_stencilOp[(_stencil&BGFX_STENCIL_OP_PASS_Z_MASK)>>BGFX_STENCIL_OP_PASS_Z_SHIFT];
+		}
+
+		/// The vertex layout a program's [[attribute(n)]] list asks for, out of
+		/// the draw's streams (stream k at Metal buffer k) and its instance data
+		/// (at buffer numStreams, 16 bytes per i_dataN).
+		GPU::VertexLayout translateLayout(const ProgramEacp& _program, uint8_t _numStreams, const VertexLayout** _layouts, uint8_t _numInstanceData)
+		{
+			GPU::VertexLayout result;
+
+			for (uint8_t stream = 0; stream < _numStreams; ++stream)
+			{
+				result.buffer(stream, _layouts[stream]->getStride(), GPU::StepRate::PerVertex);
+			}
+
+			if (0 < _numInstanceData)
+			{
+				result.buffer(_numStreams, _numInstanceData*16, GPU::StepRate::PerInstance);
+			}
+
+			if (result.buffers.empty() )
+			{
+				result.buffer(0, 4, GPU::StepRate::PerVertex);
+			}
+
+			for (uint32_t location = 0; location < _program.m_numAttributes; ++location)
+			{
+				const AttributeSource& source = _program.m_attributes[location];
+
+				GPU::VertexFormat format = GPU::VertexFormat::UByte4Norm;
+				int offset      = 0;
+				int bufferIndex = 0;
+				bool found      = false;
+
+				if (AttributeSource::Vertex == source.m_kind)
+				{
+					const Attrib::Enum attr = Attrib::Enum(source.m_index);
+
+					for (uint8_t stream = 0; stream < _numStreams && !found; ++stream)
+					{
+						const VertexLayout& layout = *_layouts[stream];
+
+						if (layout.has(attr) )
+						{
+							uint8_t num;
+							AttribType::Enum type;
+							bool normalized;
+							bool asInt;
+							layout.decode(attr, num, type, normalized, asInt);
+
+							format      = toVertexFormat(num, type, normalized, asInt);
+							offset      = layout.m_offset[attr];
+							bufferIndex = stream;
+							found       = true;
+						}
+					}
+				}
+				else if (AttributeSource::Instance == source.m_kind
+					 &&  source.m_index < _numInstanceData)
+				{
+					format      = GPU::VertexFormat::Float4;
+					offset      = source.m_index*16;
+					bufferIndex = _numStreams;
+					found       = true;
+				}
+
+				if (!found)
+				{
+					// What the stream does not carry reads the first bytes of
+					// stream 0 rather than failing the pipeline, as Metal's
+					// fallback attribute does.
+					BX_TRACE("eacp: attribute(%d) is not in the draw's streams.", location);
+				}
+
+				result.attribute(format, offset, bufferIndex);
+			}
+
+			return result;
+		}
+
+		const PipelineEacp* getPipeline(uint64_t _state, uint64_t _stencil, ProgramHandle _program, uint8_t _numStreams, const VertexLayout** _layouts, uint8_t _numInstanceData)
+		{
+			_state &= kPipelineStateMask;
+
+			const bool hasStencil = m_target.m_stencil;
+
+			_stencil = hasStencil && stencilEnabled(_stencil)
+				? _stencil & kStencilNoRefMask
+				: 0
+				;
+
+			// The draw before asked for the same pipeline into the same target
+			// (m_lastPipeline is dropped whenever a pass begins): no hash, as
+			// renderer_mtl.cpp skips its pipeline lookup while the state word
+			// and program are unchanged.
+			if (NULL != m_lastPipeline
+			&&  _state           == m_lastQuery.m_state
+			&&  _stencil         == m_lastQuery.m_stencil
+			&&  _program.idx     == m_lastQuery.m_program
+			&&  _numStreams      == m_lastQuery.m_numStreams
+			&&  _numInstanceData == m_lastQuery.m_numInstanceData)
+			{
+				bool same = true;
+
+				for (uint8_t ii = 0; ii < _numStreams && same; ++ii)
+				{
+					same = _layouts[ii]->m_hash == m_lastQuery.m_layoutHash[ii];
+				}
+
+				if (same)
+				{
+					return m_lastPipeline;
+				}
+			}
+
+			m_lastQuery.m_state           = _state;
+			m_lastQuery.m_stencil         = _stencil;
+			m_lastQuery.m_program         = _program.idx;
+			m_lastQuery.m_numStreams      = _numStreams;
+			m_lastQuery.m_numInstanceData = _numInstanceData;
+
+			for (uint8_t ii = 0; ii < _numStreams; ++ii)
+			{
+				m_lastQuery.m_layoutHash[ii] = _layouts[ii]->m_hash;
+			}
+
+			const ProgramEacp& program = *m_program[_program.idx];
+
+			bx::HashMurmur3 murmur;
+			murmur.begin();
+			murmur.add(_state);
+			murmur.add(_stencil);
+			murmur.add(_program.idx);
+			murmur.add(program.m_vsh->m_hash);
+			murmur.add(program.m_fsh->m_hash);
+			murmur.add(_numStreams);
+			murmur.add(_numInstanceData);
+			murmur.add(uint32_t(m_target.m_colorFormat) );
+			murmur.add(m_target.m_sampleCount);
+			murmur.add(m_target.m_depth);
+			murmur.add(m_target.m_stencil);
+
+			for (uint8_t ii = 0; ii < _numStreams; ++ii)
+			{
+				murmur.add(_layouts[ii]->m_hash);
+			}
+
+			const uint32_t key = murmur.end() | 1;
+
+			if (key == m_lastPipelineKey)
+			{
+				return m_lastPipeline;
+			}
+
+			auto it = m_pipelines.find(key);
+
+			if (it == m_pipelines.end() )
+			{
+				PipelineEacp* entry = BX_NEW(g_allocator, PipelineEacp);
+				entry->m_program = _program.idx;
+
+				GPU::RenderPipelineDescriptor desc;
+				desc.library      = &*program.m_library;
+				desc.vertexLayout = translateLayout(program, _numStreams, _layouts, _numInstanceData);
+				desc.colorFormat  = m_target.m_colorFormat;
+				desc.sampleCount  = m_target.m_sampleCount;
+
+				desc.topology = s_primInfo[(_state&BGFX_STATE_PT_MASK)>>BGFX_STATE_PT_SHIFT].m_type;
+
+				desc.colorWriteMask.red   = 0 != (_state & BGFX_STATE_WRITE_R);
+				desc.colorWriteMask.green = 0 != (_state & BGFX_STATE_WRITE_G);
+				desc.colorWriteMask.blue  = 0 != (_state & BGFX_STATE_WRITE_B);
+				desc.colorWriteMask.alpha = 0 != (_state & BGFX_STATE_WRITE_A);
+
+				if (0 != (_state & BGFX_STATE_BLEND_INDEPENDENT) )
+				{
+					traceOnce(Unsupported::BlendIndependent, "G3: independent blend is drawn with blending off.");
+				}
+				else if (0 != (_state & BGFX_STATE_BLEND_MASK) )
+				{
+					const uint32_t blend    = uint32_t( (_state&BGFX_STATE_BLEND_MASK         )>>BGFX_STATE_BLEND_SHIFT);
+					const uint32_t equation = uint32_t( (_state&BGFX_STATE_BLEND_EQUATION_MASK)>>BGFX_STATE_BLEND_EQUATION_SHIFT);
+
+					const uint32_t srcRGB = (blend    )&0xf;
+					const uint32_t dstRGB = (blend>> 4)&0xf;
+					const uint32_t srcA   = (blend>> 8)&0xf;
+					const uint32_t dstA   = (blend>>12)&0xf;
+
+					for (uint32_t factor : { srcRGB, dstRGB, srcA, dstA })
+					{
+						if (factor >= 12)
+						{
+							traceOnce(Unsupported::BlendFactor, "G26: the constant blend factor (BGFX_STATE_BLEND_FACTOR) is drawn as One/Zero.");
+						}
+					}
+
+					GPU::BlendState state;
+					state.enabled          = true;
+					state.sourceColor      = s_blendFactor[srcRGB][0];
+					state.destinationColor = s_blendFactor[dstRGB][0];
+					state.colorOperation   = s_blendEquation[bx::min<uint32_t>( (equation   )&0x7, 4)];
+					state.sourceAlpha      = s_blendFactor[srcA][1];
+					state.destinationAlpha = s_blendFactor[dstA][1];
+					state.alphaOperation   = s_blendEquation[bx::min<uint32_t>( (equation>>3)&0x7, 4)];
+					desc.blend = state;
+				}
+
+				// A pipeline must agree with the pass about whether there is a
+				// depth plane, so every pipeline into a target with one has it
+				// and "no depth test" is Always.
+				desc.depth        = m_target.m_depth;
+				desc.depthCompare = s_cmpFunc[(_state&BGFX_STATE_DEPTH_TEST_MASK)>>BGFX_STATE_DEPTH_TEST_SHIFT];
+				desc.depthWrite   = 0 != (_state & BGFX_STATE_WRITE_Z);
+
+				const uint32_t cull = uint32_t( (_state&BGFX_STATE_CULL_MASK)>>BGFX_STATE_CULL_SHIFT);
+				desc.cullMode  = 1 == cull ? GPU::CullMode::Front
+					: 2 == cull ? GPU::CullMode::Back
+					: GPU::CullMode::None
+					;
+				desc.frontFace = 0 != (_state & BGFX_STATE_FRONT_CCW)
+					? GPU::Winding::CounterClockwise
+					: GPU::Winding::Clockwise
+					;
+
+				desc.stencil = hasStencil;
+
+				if (hasStencil
+				&&  0 != _stencil)
+				{
+					const uint32_t fstencil = unpackStencil(0, _stencil);
+					const uint32_t bstencil = stencilFrontAndBack(_stencil) ? unpackStencil(1, _stencil) : fstencil;
+
+					translateStencil(desc.stencilFront, fstencil);
+					translateStencil(desc.stencilBack,  bstencil);
+
+					// G18: one read and one write mask for both faces.
+					desc.stencilReadMask  = uint8_t( (fstencil&BGFX_STENCIL_FUNC_RMASK_MASK)>>BGFX_STENCIL_FUNC_RMASK_SHIFT);
+					desc.stencilWriteMask = unpackStencilWriteMask(_stencil);
+				}
+
+				entry->m_pipeline.emplace(GPU::Device::shared().makeRenderPipeline(desc) );
+
+				if (!entry->m_pipeline->isValid() )
+				{
+					BX_TRACE("eacp: pipeline for program %d failed (state 0x%016" PRIx64 ").", _program.idx, _state);
+				}
+
+				it = m_pipelines.emplace(key, entry).first;
+			}
+
+			m_lastPipelineKey = key;
+			m_lastPipeline    = it->second;
+
+			return it->second;
+		}
+
+		// ---- the frame -------------------------------------------------------------
+
+		/// A view's clear inside an open pass, where the pass's own clear would
+		/// clear the whole target: bgfx's clear quad, scissored to the view.
+		void clearQuad(GPU::RenderPass& _pass, const ClearQuad& _clearQuad, const Clear& _clear, const float _palette[][4])
+		{
+			if (!isValid(_clearQuad.m_program[0])
+			||  NULL == m_program[_clearQuad.m_program[0].idx]
+			||  !m_program[_clearQuad.m_program[0].idx]->m_library
+			||  NULL == m_vertexBuffers[_clearQuad.m_vb.idx])
+			{
+				return;
+			}
+
+			const uint64_t state = 0
+				| (_clear.m_flags & BGFX_CLEAR_COLOR ? BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A         : 0)
+				| (_clear.m_flags & BGFX_CLEAR_DEPTH ? BGFX_STATE_DEPTH_TEST_ALWAYS|BGFX_STATE_WRITE_Z : 0)
+				| BGFX_STATE_PT_TRISTRIP
+				;
+
+			const uint64_t stencil = _clear.m_flags & BGFX_CLEAR_STENCIL
+				? packStencil(0
+					| BGFX_STENCIL_TEST_ALWAYS
+					| BGFX_STENCIL_FUNC_REF(_clear.m_stencil)
+					| BGFX_STENCIL_FUNC_RMASK(0xff)
+					| BGFX_STENCIL_OP_FAIL_S_REPLACE
+					| BGFX_STENCIL_OP_FAIL_Z_REPLACE
+					| BGFX_STENCIL_OP_PASS_Z_REPLACE
+					, BGFX_STENCIL_NONE)
+				: 0
+				;
+
+			const VertexLayout* layout = &m_vertexLayouts[_clearQuad.m_layout.idx];
+			const PipelineEacp* pipeline = getPipeline(state, stencil, _clearQuad.m_program[0], 1, &layout, 0);
+
+			if (!pipeline->m_pipeline->isValid() )
+			{
+				return;
+			}
+
+			const ProgramEacp& program = *m_program[_clearQuad.m_program[0].idx];
+
+			const float depth[4] = { _clear.m_depth };
+			const ::eacp::Graphics::Color color = clearColor(_clear, _palette);
+			const float rgba[4] = { color.r, color.g, color.b, color.a };
+
+			bx::memCopy(m_vsScratch, depth, sizeof(depth) );
+			bx::memCopy(m_fsScratch, rgba, sizeof(rgba) );
+
+			_pass.setPipeline(*pipeline->m_pipeline);
+			_pass.setStencilReference(_clear.m_stencil);
+			bindUniforms(_pass, program);
+			_pass.setVertexBuffer(m_vertexBuffers[_clearQuad.m_vb.idx]->range(m_vertexStream), 0);
+			_pass.draw(4);
+		}
+
+		void submit(Frame* _render, const ClearQuad& _clearQuad, const MipGen& /*_mipGen*/, TextVideoMemBlitter& _textVideoMemBlitter) override
+		{
+			const int64_t timerFreq = bx::getHPFrequency();
+			const int64_t timeBegin = bx::getHPCounter();
+
+			uint32_t statsKeyType[2] = {};
+			uint32_t statsNumPrimsRendered[BX_COUNTOF(s_primInfo)] = {};
+
+			m_colorPalette = _render->m_colorPalette;
+			m_reset        = _render->m_reset;
+
+			// This frame's updateTexture calls into the textures eacp replaces
+			// whole, one upload each.
+			for (uint32_t ii = 0; ii < BX_COUNTOF(m_textures); ++ii)
+			{
+				m_textures[ii].flush();
+			}
+
+			if (0 < _render->m_iboffset)
+			{
+				TransientIndexBuffer* ib = _render->m_transientIb;
+				updateDynamicBuffer(m_indexBuffers[ib->handle.idx], bx::strideAlign(_render->m_iboffset, 4), ib->data);
+			}
+
+			if (0 < _render->m_vboffset)
+			{
+				TransientVertexBuffer* vb = _render->m_transientVb;
+				updateDynamicBuffer(m_vertexBuffers[vb->handle.idx], bx::strideAlign(_render->m_vboffset, 4), vb->data);
+			}
+
+			_render->sort();
+
+			if (0 != (_render->m_mainSwapChain.flags & BGFX_SWAP_CHAIN_MSAA_MASK) )
+			{
+				traceOnce(Unsupported::Msaa, "MSAA asked of the window is ignored: BgfxView renders at sample count 1.");
+			}
+
+			if (0 != (_render->m_debug & BGFX_DEBUG_WIREFRAME) )
+			{
+				traceOnce(Unsupported::Wireframe, "G28: BGFX_DEBUG_WIREFRAME has no eacp fill mode.");
+			}
+
+			s_hiDpi = 0 != (_render->m_mainSwapChain.flags & BGFX_SWAP_CHAIN_HIDPI);
+
+			if (NULL != s_frame)
+			{
+				updateWindowScale(*s_frame, _render->m_mainSwapChain);
+			}
+
+			if (NULL != s_frame
+			&&  0 == (_render->m_debug & BGFX_DEBUG_IFH) )
+			{
+				submitItems(*s_frame, _render, _clearQuad, statsKeyType, statsNumPrimsRendered);
+			}
+
+			const int64_t timeEnd   = bx::getHPCounter();
+			const int64_t frameTime = timeEnd - timeBegin;
+
+			if (NULL != s_frame)
+			{
+				submitDebugText(*s_frame, _render, _textVideoMemBlitter, timeEnd, frameTime, statsKeyType, statsNumPrimsRendered);
+			}
+
+			endPass();
+			m_lastPipelineKey = 0;
+			m_lastPipeline    = NULL;
+
+			Stats& perfStats = _render->m_perfStats;
+			perfStats.cpuTimeBegin  = timeBegin;
+			perfStats.cpuTimeEnd    = timeEnd;
+			perfStats.cpuTimerFreq  = timerFreq;
+
+			// eacp's timings are of the newest frame the GPU has finished, a few
+			// behind this one (FrameTimings), in milliseconds; bgfx's are ticks
+			// of gpuTimerFreq, here nanoseconds.
+			const GPU::FrameTimings& timings = GPU::Device::shared().lastFrameTimings();
+			perfStats.gpuTimeBegin  = 0;
+			perfStats.gpuTimeEnd    = int64_t(timings.milliseconds*1000000.0);
+			perfStats.gpuTimerFreq  = 1000000000;
+			perfStats.gpuFrameNum   = uint32_t(timings.frameIndex);
+
+			fillViewStats(_render, timings);
+
+			perfStats.numDraw       = statsKeyType[0];
+			perfStats.numCompute    = statsKeyType[1];
+			perfStats.numBlit       = _render->m_numBlitItems;
+			perfStats.numBlitRepack = _render->m_numBlitRepack;
+			bx::memCopy(perfStats.numPrims, statsNumPrimsRendered, sizeof(perfStats.numPrims) );
+
+			perfStats.gpuMemoryMax  = -INT64_MAX;
+			perfStats.gpuMemoryUsed = -INT64_MAX;
+
+			tracePerf(timeBegin, timeEnd, timerFreq);
+		}
+
+		/// In the off-screen capture mode (EACP_BGFX_CAPTURE, which shows no
+		/// stats page), the CPU time of submit and the time from one submit to
+		/// the next, averaged over each 100 frames, in the log.
+		void tracePerf(int64_t _timeBegin, int64_t _timeEnd, int64_t _timerFreq)
+		{
+			if (!m_perfTrace)
+			{
+				return;
+			}
+
+			if (0 != m_perfLastBegin)
+			{
+				m_perfFrame += _timeBegin - m_perfLastBegin;
+				m_perfSubmit += _timeEnd - _timeBegin;
+				++m_perfNum;
+			}
+
+			m_perfLastBegin = _timeBegin;
+
+			if (100 == m_perfNum)
+			{
+				const double toMs = 1000.0/double(_timerFreq)/double(m_perfNum);
+				BX_TRACE("eacp perf: submit %.3f ms, frame %.3f ms (average of %d frames)"
+					, double(m_perfSubmit)*toMs
+					, double(m_perfFrame)*toMs
+					, m_perfNum
+					);
+				m_perfFrame  = 0;
+				m_perfSubmit = 0;
+				m_perfNum    = 0;
+			}
+		}
+
+		/// BGFX_DEBUG_PROFILER's per-view numbers: the CPU time of each view as
+		/// submit walked it, and the GPU time of the passes labelled with that
+		/// view's name (formatViewName starts with the view id) in eacp's last
+		/// finished frame, laid end to end.
+		void fillViewStats(Frame* _render, const GPU::FrameTimings& _timings)
+		{
+			Stats& perfStats = _render->m_perfStats;
+			perfStats.numViews = 0;
+
+			if (0 == (_render->m_debug & BGFX_DEBUG_PROFILER)
+			||  NULL == perfStats.viewStats)
+			{
+				return;
+			}
+
+			const uint32_t numViews = bx::min<uint32_t>(m_numViewTimes, _render->m_numViewStats);
+			int64_t gpuTime = 0;
+
+			for (uint32_t ii = 0; ii < numViews; ++ii)
+			{
+				const ViewTime& time = m_viewTimes[ii];
+				ViewStats& viewStats = perfStats.viewStats[ii];
+
+				viewStats.view         = ViewId(time.m_view);
+				viewStats.cpuTimeBegin = time.m_cpuBegin;
+				viewStats.cpuTimeEnd   = time.m_cpuEnd;
+				bx::strCopy(viewStats.name, BGFX_CONFIG_MAX_VIEW_NAME, getViewName(_render, time.m_view) );
+
+				double milliseconds = 0.0;
+
+				for (const GPU::PassTiming& pass : _timings.passes)
+				{
+					if (4 <= pass.label.size()
+					&&  bx::isNumeric(pass.label[3])
+					&&  uint32_t(atoi(pass.label.substr(0, 4).c_str() ) ) == time.m_view)
+					{
+						milliseconds += pass.milliseconds;
+					}
+				}
+
+				viewStats.gpuTimeBegin = gpuTime;
+				gpuTime += int64_t(milliseconds*1000000.0);
+				viewStats.gpuTimeEnd   = gpuTime;
+				viewStats.gpuFrameNum  = uint32_t(_timings.frameIndex);
+			}
+
+			perfStats.numViews = uint16_t(numViews);
+		}
+
+		static void updateDynamicBuffer(BufferEacp* _buffer, uint32_t _size, const void* _data)
+		{
+			if (NULL != _buffer)
+			{
+				_buffer->update(0, _size, _data);
+			}
+		}
+
+		/// bgfx's backbuffer is the main swap chain's size, which the entry
+		/// layer reports in points unless BGFX_RESET_HIDPI is set (as
+		/// entry_osx.mm does); the eacp drawable is always in pixels, and eacp
+		/// has no way to render it at a lower scale. So the backbuffer is mapped
+		/// onto the drawable: view rects, scissors and the predefined
+		/// u_viewRect/u_viewTexel of window draws are scaled by drawable over
+		/// backbuffer, which on Retina without HIDPI is the backing scale (the
+		/// picture stock Metal shows, rasterised at the panel's resolution) and
+		/// with HIDPI is 1.
+		void updateWindowScale(GPU::Frame& _frame, const SwapChain& _swapChain)
+		{
+			const ::eacp::Graphics::Point size = _frame.pixelSize();
+
+			m_backbufferWidth  = uint16_t(bx::max<uint32_t>(_swapChain.width,  1) );
+			m_backbufferHeight = uint16_t(bx::max<uint32_t>(_swapChain.height, 1) );
+			m_windowScaleX     = 0.0f < size.x ? float(size.x)/float(m_backbufferWidth)  : 1.0f;
+			m_windowScaleY     = 0.0f < size.y ? float(size.y)/float(m_backbufferHeight) : 1.0f;
+		}
+
+		/// A rect of the open pass's target from bgfx's units into the
+		/// target's pixels: the window's are scaled (updateWindowScale), a
+		/// texture's are its own.
+		::eacp::Graphics::Rect toPassPixels(const Rect& _rect) const
+		{
+			return
+			{
+				float(_rect.m_x)*m_passScaleX,
+				float(_rect.m_y)*m_passScaleY,
+				float(_rect.m_width )*m_passScaleX,
+				float(_rect.m_height)*m_passScaleY,
+			};
+		}
+
+		/// A window view's rect in drawable pixels, for u_viewRect and
+		/// u_viewTexel: what gl_FragCoord is measured in.
+		Rect toWindowPixels(const Rect& _rect) const
+		{
+			const uint16_t x = uint16_t(float(_rect.m_x)*m_windowScaleX + 0.5f);
+			const uint16_t y = uint16_t(float(_rect.m_y)*m_windowScaleY + 0.5f);
+			const uint16_t r = uint16_t(float(_rect.m_x + _rect.m_width )*m_windowScaleX + 0.5f);
+			const uint16_t b = uint16_t(float(_rect.m_y + _rect.m_height)*m_windowScaleY + 0.5f);
+			return Rect(x, y, uint16_t(bx::max(r - x, 1) ), uint16_t(bx::max(b - y, 1) ) );
+		}
+
+		/// A pass on the window, continuing its depth when an earlier pass of
+		/// this frame kept it and the descriptor does not clear.
+		void beginWindowPass(GPU::Frame& _frame, GPU::RenderPassDescriptor& _descriptor, bool _clearDepth)
+		{
+			_descriptor.depthAction = !_clearDepth && m_windowDepthKept
+				? GPU::DepthAction::Resume
+				: GPU::DepthAction::Keep
+				;
+
+			m_computePass.reset();
+			m_pass.reset();
+			m_pass.emplace(PassMaker{ _frame, _descriptor, NULL });
+			m_target          = windowTarget();
+			m_passScaleX      = m_windowScaleX;
+			m_passScaleY      = m_windowScaleY;
+			m_passTexture     = kInvalidHandle;
+			m_windowDepthKept = true;
+			m_needFlush       = true;
+			m_lastPipelineKey = 0;
+			m_lastPipeline    = NULL;
+		}
+
+		/// A pass into a render target texture. Its depth plane is kept at the
+		/// end of every pass, so a later view on the same framebuffer that
+		/// does not clear, or a draw sampling the depth, finds it.
+		void beginTexturePass(GPU::Frame& _frame, TextureEacp& _texture, uint16_t _idx, GPU::RenderPassDescriptor& _descriptor, bool _clearDepth)
+		{
+			_descriptor.depthAction = !_clearDepth && _texture.m_depthKept
+				? GPU::DepthAction::Resume
+				: GPU::DepthAction::Keep
+				;
+
+			m_computePass.reset();
+			m_pass.reset();
+			m_pass.emplace(PassMaker{ _frame, _descriptor, &*_texture.m_texture });
+			m_target            = textureTarget(_texture);
+			m_passScaleX        = 1.0f;
+			m_passScaleY        = 1.0f;
+			m_passTexture       = _idx;
+			_texture.m_depthKept = true;
+			m_needFlush         = true;
+			m_lastPipelineKey   = 0;
+			m_lastPipeline      = NULL;
+		}
+
+		/// Ends whichever pass is open, render or compute: a command buffer
+		/// takes one encoder at a time.
+		void endPass()
+		{
+			m_computePass.reset();
+			m_pass.reset();
+			m_passTexture = kInvalidHandle;
+		}
+
+		// ---- blits ----------------------------------------------------------------
+
+		/// G5: eacp has no copies, so a texture-to-texture blit is a draw into
+		/// the destination (which createTexture made a render target), a
+		/// fullscreen triangle reading the source texel for texel. Mip 0, layer
+		/// 0, colour formats; the rest is skipped. Metal-only MSL, which is
+		/// fine until G5 replaces it.
+		void submitBlit(GPU::Frame& _frame, const BlitItem& _blit)
+		{
+			if (_blit.m_src.isBuffer()
+			||  _blit.m_dst.isBuffer() )
+			{
+				traceOnce(Unsupported::Blit, "G5: a blit to or from a buffer is skipped (no eacp copies).");
+				return;
+			}
+
+			const uint16_t srcIdx = _blit.m_src.idx;
+			const uint16_t dstIdx = _blit.m_dst.idx;
+			TextureEacp& src = m_textures[srcIdx];
+			TextureEacp& dst = m_textures[dstIdx];
+
+			if (srcIdx == dstIdx
+			||  src.m_depthFormat
+			||  dst.m_depthFormat
+			||  !src.m_texture
+			||  src.m_cube
+			||  !dst.isTarget()
+			||  0 != _blit.m_srcMip
+			||  0 != _blit.m_dstMip
+			||  0 != _blit.m_srcZ
+			||  0 != _blit.m_dstZ
+			||  1 < _blit.m_depth)
+			{
+				traceOnce(Unsupported::BlitDraw, "G5: a blit other than colour to a render target or blit destination, mip 0, layer 0, is skipped.");
+				return;
+			}
+
+			if (!m_blitLibrary)
+			{
+				static const char* s_blitMsl =
+					"#include <metal_stdlib>\n"
+					"using namespace metal;\n"
+					"struct BlitVaryings { float4 position [[position]]; };\n"
+					"vertex BlitVaryings blitVs(uint vid [[vertex_id]])\n"
+					"{\n"
+					"\tfloat2 uv = float2( (vid << 1) & 2, vid & 2);\n"
+					"\tBlitVaryings out;\n"
+					"\tout.position = float4(uv*2.0 - 1.0, 0.0, 1.0);\n"
+					"\treturn out;\n"
+					"}\n"
+					"fragment float4 blitFs(BlitVaryings in [[stage_in]], texture2d<float> src [[texture(0)]], constant int4& offset [[buffer(16)]])\n"
+					"{\n"
+					"\treturn src.read(uint2(int2(in.position.xy) + offset.xy) );\n"
+					"}\n"
+					;
+
+				GPU::ShaderSource source = GPU::ShaderSource::msl(s_blitMsl);
+				source.withVertex("blitVs");
+				source.withFragment("blitFs");
+				m_blitLibrary.emplace(GPU::Device::shared().makeShaderLibrary(source) );
+			}
+
+			if (!m_blitLibrary->isValid() )
+			{
+				return;
+			}
+
+			const uint32_t srcWidth  = uint32_t(src.m_texture->width() );
+			const uint32_t srcHeight = uint32_t(src.m_texture->height() );
+			const uint32_t dstWidth  = uint32_t(dst.m_texture->width() );
+			const uint32_t dstHeight = uint32_t(dst.m_texture->height() );
+
+			if (_blit.m_srcX >= srcWidth
+			||  _blit.m_srcY >= srcHeight
+			||  _blit.m_dstX >= dstWidth
+			||  _blit.m_dstY >= dstHeight)
+			{
+				return;
+			}
+
+			const uint32_t width  = bx::min<uint32_t>(_blit.m_width,  bx::min(srcWidth  - _blit.m_srcX, dstWidth  - _blit.m_dstX) );
+			const uint32_t height = bx::min<uint32_t>(_blit.m_height, bx::min(srcHeight - _blit.m_srcY, dstHeight - _blit.m_dstY) );
+
+			if (0 == width
+			||  0 == height)
+			{
+				return;
+			}
+
+			GPU::RenderPassDescriptor descriptor;
+			descriptor.label = "blit";
+			descriptor.clear = false;
+			beginTexturePass(_frame, dst, dstIdx, descriptor, false);
+
+			bx::HashMurmur3 murmur;
+			murmur.begin();
+			murmur.add(uint32_t(m_target.m_colorFormat) );
+			murmur.add(m_target.m_sampleCount);
+			murmur.add(m_target.m_depth);
+			murmur.add(m_target.m_stencil);
+			const uint32_t key = murmur.end();
+
+			auto it = m_blitPipelines.find(key);
+
+			if (it == m_blitPipelines.end() )
+			{
+				GPU::RenderPipelineDescriptor desc;
+				desc.library      = &*m_blitLibrary;
+				desc.colorFormat  = m_target.m_colorFormat;
+				desc.sampleCount  = m_target.m_sampleCount;
+				desc.depth        = m_target.m_depth;
+				desc.depthCompare = GPU::CompareFunction::Always;
+				desc.depthWrite   = false;
+				desc.stencil      = m_target.m_stencil;
+
+				PipelineEacp* entry = BX_NEW(g_allocator, PipelineEacp);
+				entry->m_program = kInvalidHandle;
+				entry->m_pipeline.emplace(GPU::Device::shared().makeRenderPipeline(desc) );
+				it = m_blitPipelines.emplace(key, entry).first;
+			}
+
+			if (it->second->m_pipeline->isValid() )
+			{
+				GPU::RenderPass& pass = *m_pass;
+
+				const ::eacp::Graphics::Rect rect(float(_blit.m_dstX), float(_blit.m_dstY), float(width), float(height) );
+				pass.setViewport({ 0.0f, 0.0f, float(dstWidth), float(dstHeight) }, 0.0f, 1.0f);
+				pass.setScissorRect(rect);
+				pass.setPipeline(*it->second->m_pipeline);
+
+				const int32_t offset[4] =
+				{
+					int32_t(_blit.m_srcX) - int32_t(_blit.m_dstX),
+					int32_t(_blit.m_srcY) - int32_t(_blit.m_dstY),
+					0,
+					0,
+				};
+
+				pass.setFragmentBytes(offset, int(sizeof(offset) ), 0);
+				pass.setFragmentTexture(*src.m_texture, 0, getSampler(BGFX_SAMPLER_POINT|BGFX_SAMPLER_UVW_CLAMP, 0, UINT8_MAX) );
+				pass.draw(3);
+			}
+
+			endPass();
+		}
+
+		void submitItems(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, uint32_t* _statsKeyType, uint32_t* _statsNumPrimsRendered)
+		{
+			static ViewState viewState;
+			viewState.reset(_render);
+
+			m_windowDepthKept = false;
+			m_passTexture     = kInvalidHandle;
+			m_numViewTimes    = 0;
+
+			if (!m_fallbackDepth.m_depthKept
+			&&  m_fallbackDepth.isTarget() )
+			{
+				GPU::RenderPassDescriptor descriptor;
+				descriptor.clear = true;
+				beginTexturePass(_frame, m_fallbackDepth, kInvalidHandle-1, descriptor, true);
+				endPass();
+			}
+
+			SortKey key;
+			uint16_t view = UINT16_MAX;
+			const View* renderView = &_render->view(0);
+			char viewName[BGFX_CONFIG_MAX_VIEW_NAME] = "";
+
+			UniformCacheState ucs(_render);
+			BlitState bs(_render);
+
+			bool viewSkipped = true;
+			bool viewBegun   = false; // the view's first draw has opened (or joined) its pass
+			TextureEacp* viewTarget = NULL;
+			Rect viewScissorRect;
+			viewScissorRect.clear();
+			uint16_t currentScissor = UINT16_MAX - 1;
+			uint32_t currentStencilRef = UINT32_MAX;
+
+			// What the open pass has bound, so that an unchanged pipeline or
+			// vertex stream is not sent again: eacp's setPipeline re-encodes
+			// the depth-stencil state, winding and cull mode on every call.
+			const PipelineEacp* currentPipeline = NULL;
+			BoundStream currentStreams[BGFX_CONFIG_MAX_VERTEX_STREAMS+1];
+
+			viewState.m_rect = _render->view(0).m_rect;
+
+			for (uint32_t item = 0, numItems = _render->m_numRenderItems; item < numItems; ++item)
+			{
+				const bool isCompute = key.decode(_render->m_sortKeys[item], _render->m_viewRemap);
+				_statsKeyType[isCompute]++;
+
+				const uint32_t itemIdx       = _render->m_sortValues[item];
+				const RenderItem& renderItem = _render->m_renderItem[itemIdx];
+
+				if (key.m_view != view)
+				{
+					view = key.m_view;
+					renderView = &_render->view(view);
+					viewState.setView(*renderView);
+					viewState.m_rect = renderView->m_rect;
+
+					formatViewName(viewName, _render, view, "  ");
+
+					submitUniformCache(ucs, view);
+
+					while (bs.hasItem(view) )
+					{
+						submitBlit(_frame, bs.advance() );
+					}
+
+					noteViewTime(view);
+
+					// A view's compute items get a pass, and a timing label, of
+					// their own.
+					m_computePass.reset();
+
+					viewTarget  = NULL;
+					viewSkipped = false;
+					viewBegun   = false;
+
+					if (isValid(renderView->m_fbh) )
+					{
+						viewTarget  = frameBufferTarget(renderView->m_fbh.idx);
+						viewSkipped = NULL == viewTarget;
+					}
+				}
+
+				if (isCompute)
+				{
+					// A view's compute items sort before its draws; they need
+					// no target, so a view whose framebuffer is skipped still
+					// dispatches.
+					submitCompute(_frame, viewState, view, *renderView, viewName, renderItem.compute, key.m_program, _render);
+					continue;
+				}
+
+				if (viewSkipped)
+				{
+					continue;
+				}
+
+				if (!viewBegun
+				||  !m_pass)
+				{
+					// The view's pass opens at its first draw, after its compute
+					// items, and clears then (as renderer_mtl.cpp's does). A draw
+					// whose pass a dispatch ended reopens it without the clear.
+					beginView(_frame, _render, _clearQuad, *renderView, viewName, viewTarget, viewScissorRect, !viewBegun);
+					viewBegun = true;
+
+					// The view's draws see their rect in the pixels of what
+					// they draw into (the view's compute items, before this,
+					// saw bgfx's).
+					viewState.m_rect = NULL == viewTarget
+						? toWindowPixels(renderView->m_rect)
+						: renderView->m_rect
+						;
+
+					currentScissor    = UINT16_MAX - 1;
+					currentStencilRef = UINT32_MAX;
+					currentPipeline   = NULL;
+					m_lastPipelineKey = 0;
+					m_lastPipeline    = NULL;
+
+					for (BoundStream& bound : currentStreams)
+					{
+						bound = BoundStream();
+					}
+				}
+
+				const RenderDraw& draw = renderItem.draw;
+
+				if (_render->m_frameCache.isZeroArea(viewScissorRect, draw.m_scissor) )
+				{
+					continue;
+				}
+
+				if (0 == draw.m_streamMask
+				||  UINT32_MAX == draw.m_streamMask
+				||  !isValid(key.m_program) )
+				{
+					continue;
+				}
+
+				if (isValid(draw.m_indirectBuffer) )
+				{
+					traceOnce(Unsupported::Indirect, "G8: indirect draws are skipped.");
+					continue;
+				}
+
+				ProgramEacp* program = m_program[key.m_program.idx];
+
+				if (NULL == program
+				||  !program->m_library
+				||  program->isCompute() )
+				{
+					continue;
+				}
+
+				const RenderBind& renderBind = _render->m_renderBind[draw.m_bindIdx];
+
+				if (program->usesStorage()
+				&&  hasImageBinding(renderBind) )
+				{
+					traceOnce(Unsupported::RenderImage, "G40: draws that bind a storage image to a render stage are skipped.");
+					continue;
+				}
+
+				if (0 != program->m_vsh->m_numSamplers)
+				{
+					traceOnce(Unsupported::VertexTexture, "G17: draws whose vertex shader samples a texture are skipped (eacp binds fragment textures only).");
+					continue;
+				}
+
+				GPU::RenderPass& pass = *m_pass;
+
+				// Streams, in the order bgfx's stream mask names them, compacted
+				// to Metal buffers 0, 1, ...
+				const VertexLayout* layouts[BGFX_CONFIG_MAX_VERTEX_STREAMS];
+				GPU::BufferRange ranges[BGFX_CONFIG_MAX_VERTEX_STREAMS];
+				uint8_t  numStreams  = 0;
+				uint32_t numVertices = draw.m_numVertices;
+				bool streamsValid    = true;
+
+				for (BitMaskToIndexIteratorT it(draw.m_streamMask); !it.isDone(); it.next(), numStreams++)
+				{
+					const uint8_t idx = it.idx;
+					const Stream& stream = draw.m_stream[idx];
+					BufferEacp* vb = m_vertexBuffers[stream.m_handle.idx];
+
+					if (NULL == vb)
+					{
+						streamsValid = false;
+						break;
+					}
+
+					const uint16_t decl = isValid(stream.m_layoutHandle)
+						? stream.m_layoutHandle.idx
+						: vb->m_layoutHandle.idx
+						;
+
+					if (kInvalidHandle == decl)
+					{
+						streamsValid = false;
+						break;
+					}
+
+					const VertexLayout& layout = m_vertexLayouts[decl];
+					const uint32_t stride = bx::max<uint32_t>(layout.m_stride, 1);
+
+					layouts[numStreams] = &layout;
+
+					numVertices = bx::min(UINT32_MAX == draw.m_numVertices
+						? vb->m_size/stride
+						: draw.m_numVertices
+						, numVertices
+						);
+
+					const uint32_t offset = stream.m_startVertex*stride;
+					GPU::BufferRange range = vb->range(m_vertexStream);
+					range.offset += offset;
+					range.bytes   = bx::max<int64_t>(range.bytes - offset, 0);
+					ranges[numStreams] = range;
+				}
+
+				if (!streamsValid)
+				{
+					continue;
+				}
+
+				const uint8_t numInstanceData = isValid(draw.m_instanceDataBuffer)
+					? uint8_t(draw.m_instanceDataStride/16)
+					: 0
+					;
+
+				const uint64_t state = draw.m_stateFlags;
+				const PipelineEacp* pipeline = getPipeline(state, draw.m_stencil, key.m_program, numStreams, layouts, numInstanceData);
+
+				if (!pipeline->m_pipeline->isValid() )
+				{
+					continue;
+				}
+
+				if (pipeline != currentPipeline)
+				{
+					currentPipeline = pipeline;
+					pass.setPipeline(*pipeline->m_pipeline);
+				}
+
+				for (uint8_t ii = 0; ii < numStreams; ++ii)
+				{
+					if (currentStreams[ii].set(ranges[ii]) )
+					{
+						pass.setVertexBuffer(ranges[ii], ii);
+					}
+				}
+
+				if (0 < numInstanceData)
+				{
+					BufferEacp* inst = m_vertexBuffers[draw.m_instanceDataBuffer.idx];
+
+					if (NULL == inst)
+					{
+						continue;
+					}
+
+					GPU::BufferRange range = inst->range(m_vertexStream);
+					range.offset += draw.m_instanceDataOffset;
+					range.bytes   = bx::max<int64_t>(range.bytes - draw.m_instanceDataOffset, 0);
+
+					if (currentStreams[numStreams].set(range) )
+					{
+						pass.setVertexBuffer(range, numStreams);
+					}
+				}
+
+				const uint32_t ref = (unpackStencil(0, draw.m_stencil)&BGFX_STENCIL_FUNC_REF_MASK)>>BGFX_STENCIL_FUNC_REF_SHIFT;
+				if (ref != currentStencilRef)
+				{
+					currentStencilRef = ref;
+					pass.setStencilReference(ref);
+				}
+
+				if (draw.m_scissor != currentScissor)
+				{
+					currentScissor = draw.m_scissor;
+
+					Rect scissorRect = viewScissorRect;
+					if (UINT16_MAX != draw.m_scissor)
+					{
+						scissorRect.setIntersect(viewScissorRect, _render->m_frameCache.m_rectCache.m_cache[draw.m_scissor]);
+					}
+
+					pass.setScissorRect(toPassPixels(scissorRect) );
+				}
+
+				if (UINT16_MAX != draw.m_depthBias
+				||  0 != renderView->m_depthBias.m_constant
+				||  0.0f != renderView->m_depthBias.m_slopeScale)
+				{
+					traceOnce(Unsupported::DepthBias, "G27: depth bias has no eacp equivalent and is ignored.");
+				}
+
+				viewState.m_alphaRef = ( (state&BGFX_STATE_ALPHA_REF_MASK)>>BGFX_STATE_ALPHA_REF_SHIFT)/255.0f;
+
+				rendererUpdateUniforms(this, _render->m_uniformBuffer[draw.m_uniformIdx], draw.m_uniformBegin, draw.m_uniformEnd);
+
+				if (NULL != program->m_vsh->m_constantBuffer)
+				{
+					commit(*program->m_vsh->m_constantBuffer);
+				}
+
+				if (NULL != program->m_fsh->m_constantBuffer)
+				{
+					commit(*program->m_fsh->m_constantBuffer);
+				}
+
+				viewState.setPredefined<4>(this, view, *renderView, *program, _render, draw);
+
+				bindUniforms(pass, *program);
+
+				bindTextures(pass, *program->m_fsh, renderBind);
+
+				if (program->usesStorage() )
+				{
+					bindRenderStorage(pass, renderBind);
+				}
+
+				const uint8_t primIndex = uint8_t( (state&BGFX_STATE_PT_MASK)>>BGFX_STATE_PT_SHIFT);
+				const PrimInfo& prim = s_primInfo[primIndex];
+				const uint32_t numInstances = bx::max<uint32_t>(draw.m_numInstances, 1);
+				uint32_t numPrimsSubmitted = 0;
+
+				if (isValid(draw.m_indexBuffer) )
+				{
+					BufferEacp* ib = m_indexBuffers[draw.m_indexBuffer.idx];
+
+					if (NULL == ib)
+					{
+						continue;
+					}
+
+					const bool isIndex16 = draw.isIndex16();
+					const uint32_t indexSize = isIndex16 ? 2 : 4;
+					const GPU::IndexFormat format = isIndex16 ? GPU::IndexFormat::UInt16 : GPU::IndexFormat::UInt32;
+
+					uint32_t numIndices = draw.m_numIndices;
+					uint32_t startIndex = draw.m_startIndex;
+
+					if (UINT32_MAX == numIndices)
+					{
+						numIndices = ib->m_size/indexSize;
+						startIndex = 0;
+					}
+
+					if (numIndices < prim.m_min)
+					{
+						continue;
+					}
+
+					const GPU::BufferRange range = ib->range(m_indexStream);
+
+					if (1 < numInstances)
+					{
+						pass.drawIndexedInstanced(range, int(numIndices), int(numInstances), format, int(startIndex) );
+					}
+					else
+					{
+						pass.drawIndexed(range, int(numIndices), format, int(startIndex) );
+					}
+
+					numPrimsSubmitted = numIndices/prim.m_div - prim.m_sub;
+				}
+				else
+				{
+					if (numVertices < prim.m_min)
+					{
+						continue;
+					}
+
+					if (1 < numInstances)
+					{
+						pass.drawInstanced(int(numVertices), int(numInstances) );
+					}
+					else
+					{
+						pass.draw(int(numVertices) );
+					}
+
+					numPrimsSubmitted = numVertices/prim.m_div - prim.m_sub;
+				}
+
+				_statsNumPrimsRendered[primIndex] += numPrimsSubmitted*numInstances;
+			}
+
+			while (bs.hasItem(BGFX_CONFIG_MAX_VIEWS) )
+			{
+				submitBlit(_frame, bs.advance() );
+			}
+
+			noteViewTime(UINT16_MAX);
+		}
+
+		/// CPU time per view for BGFX_DEBUG_PROFILER, as the views are walked;
+		/// the GPU half is filled from eacp's pass timings at the end of submit.
+		void noteViewTime(uint16_t _view)
+		{
+			const int64_t now = bx::getHPCounter();
+
+			if (0 < m_numViewTimes)
+			{
+				m_viewTimes[m_numViewTimes-1].m_cpuEnd = now;
+			}
+
+			if (UINT16_MAX != _view
+			&&  m_numViewTimes < BX_COUNTOF(m_viewTimes) )
+			{
+				ViewTime& time = m_viewTimes[m_numViewTimes++];
+				time.m_view     = _view;
+				time.m_cpuBegin = now;
+				time.m_cpuEnd   = now;
+			}
+		}
+
+		/// A view on the window or on a texture framebuffer: a new pass when
+		/// none is open on that target or when the view clears the whole target
+		/// (the pass's own clear), otherwise the open pass carries on and a
+		/// partial clear is the clear quad. A texture target's rects are in its
+		/// own pixels.
+		void beginView(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, const View& _view, const char* _viewName, TextureEacp* _target, Rect& _viewScissorRect, bool _clear)
+		{
+			Clear clear = _view.m_clear;
+
+			if (!_clear)
+			{
+				clear.m_flags = BGFX_CLEAR_NONE;
+			}
+
+			const Rect& viewRect = _view.m_rect;
+
+			const uint16_t targetIdx = NULL == _target ? kInvalidHandle : uint16_t(_target - m_textures);
+
+			Rect targetRect;
+
+			if (NULL == _target)
+			{
+				targetRect = Rect(0, 0, m_backbufferWidth, m_backbufferHeight);
+			}
+			else
+			{
+				targetRect = Rect(0, 0, uint16_t(_target->m_texture->width() ), uint16_t(_target->m_texture->height() ) );
+			}
+
+			Rect clippedRect;
+			clippedRect.setIntersect(_view.m_clippedRect, targetRect);
+
+			Rect scissorRect;
+			scissorRect.setIntersect(_view.m_scissor, targetRect);
+
+			_viewScissorRect = _view.m_scissor.isZero() ? clippedRect : scissorRect;
+
+			const uint16_t flags = clear.m_flags & BGFX_CLEAR_MASK;
+			const bool fullRect = true
+				&& 0 == viewRect.m_x
+				&& 0 == viewRect.m_y
+				&& viewRect.m_width  >= targetRect.m_width
+				&& viewRect.m_height >= targetRect.m_height
+				;
+
+			const bool clearsColor        = 0 != (flags & BGFX_CLEAR_COLOR);
+			const bool clearsDepthStencil = 0 != (flags & (BGFX_CLEAR_DEPTH|BGFX_CLEAR_STENCIL) );
+			const bool hasStencil = NULL == _target ? windowHasStencil() : _target->m_texture->hasStencil();
+
+			// G29: a pass clears depth and stencil together, depth to the far
+			// plane. A clear of one plane only (with a stencil plane there to
+			// keep), or of depth to another value, is the clear quad's, which
+			// writes exactly the planes and the value asked for.
+			const bool splitClear = true
+				&& hasStencil
+				&& clearsDepthStencil
+				&& (BGFX_CLEAR_DEPTH|BGFX_CLEAR_STENCIL) != (flags & (BGFX_CLEAR_DEPTH|BGFX_CLEAR_STENCIL) )
+				;
+			const bool otherDepth = 0 != (flags & BGFX_CLEAR_DEPTH) && 1.0f != clear.m_depth;
+			const bool passClearsDepth = fullRect && clearsDepthStencil && !splitClear && !otherDepth;
+
+			uint16_t quadFlags = flags;
+
+			const bool samePass = m_pass && m_passTexture == targetIdx;
+
+			if (!samePass
+			|| (fullRect && BGFX_CLEAR_NONE != flags) )
+			{
+				GPU::RenderPassDescriptor descriptor;
+				descriptor.label = _viewName;
+				descriptor.clear = false;
+
+				if (fullRect && clearsColor)
+				{
+					descriptor.clear      = true;
+					descriptor.clearColor = clearColor(clear, _render->m_colorPalette);
+					quadFlags &= ~BGFX_CLEAR_COLOR;
+				}
+
+				if (passClearsDepth)
+				{
+					descriptor.clearStencil = clear.m_stencil;
+					quadFlags &= ~(BGFX_CLEAR_DEPTH|BGFX_CLEAR_STENCIL);
+				}
+
+				// BGFX_CLEAR_DISCARD_* asks nothing of eacp: every plane is
+				// stored, so a later view can load it.
+
+				// A plane not cleared here picks up what the last pass on the
+				// target kept, or starts cleared when none has.
+				if (NULL == _target)
+				{
+					beginWindowPass(_frame, descriptor, passClearsDepth);
+				}
+				else
+				{
+					beginTexturePass(_frame, *_target, targetIdx, descriptor, passClearsDepth);
+				}
+			}
+
+			GPU::RenderPass& pass = *m_pass;
+
+			if (viewRect.m_x + viewRect.m_width  <= targetRect.m_width
+			&&  viewRect.m_y + viewRect.m_height <= targetRect.m_height
+			&&  0 < viewRect.m_width
+			&&  0 < viewRect.m_height)
+			{
+				pass.setViewport(
+					  toPassPixels(viewRect)
+					, _view.m_minDepth
+					, _view.m_maxDepth
+					);
+			}
+			else
+			{
+				// G30: eacp rejects a viewport past the target, which Metal and
+				// D3D12 both take. The clipped rect is the nearest thing.
+				traceOnce(Unsupported::Viewport, "G30: a view rect past the target is drawn through the clipped rect.");
+				pass.setViewport(
+					  toPassPixels(clippedRect)
+					, _view.m_minDepth
+					, _view.m_maxDepth
+					);
+			}
+
+			pass.setScissorRect(toPassPixels(clippedRect) );
+
+			if (BGFX_CLEAR_NONE != quadFlags)
+			{
+				Clear quadClear = clear;
+				quadClear.m_flags = quadFlags;
+				clearQuad(pass, _clearQuad, quadClear, _render->m_colorPalette);
+			}
+		}
+
+		/// The stats page (BGFX_DEBUG_STATS) or the examples' debug text
+		/// (BGFX_DEBUG_TEXT) over the window, as renderer_mtl.cpp's end of
+		/// submit, in the frame's last pass or a new one that loads it.
+		void submitDebugText(GPU::Frame& _frame, Frame* _render, TextVideoMemBlitter& _blitter, int64_t _timeEnd, int64_t _frameTime, const uint32_t* _statsKeyType, const uint32_t* _statsNumPrimsRendered)
+		{
+			const bool stats = 0 != (_render->m_debug & (BGFX_DEBUG_IFH|BGFX_DEBUG_STATS) );
+			const bool text  = 0 != (_render->m_debug & BGFX_DEBUG_TEXT);
+
+			static int64_t min = _frameTime;
+			static int64_t max = _frameTime;
+			min = bx::min<int64_t>(min, _frameTime);
+			max = bx::max<int64_t>(max, _frameTime);
+
+			if (!stats
+			&&  !text)
+			{
+				return;
+			}
+
+			if (!m_pass
+			||  kInvalidHandle != m_passTexture)
+			{
+				GPU::RenderPassDescriptor descriptor;
+				descriptor.label = "debugtext";
+				descriptor.clear = false;
+				beginWindowPass(_frame, descriptor, false);
+			}
+
+			if (stats)
+			{
+				TextVideoMem& tvm = m_textVideoMem;
+				tvm.resize(false, m_backbufferWidth, m_backbufferHeight);
+
+				static int64_t next = _timeEnd;
+				const int64_t timerFreq = bx::getHPFrequency();
+
+				if (_timeEnd >= next)
+				{
+					next = _timeEnd + timerFreq;
+
+					const double freq = double(timerFreq);
+					const double toMs = 1000.0/freq;
+
+					tvm.clear();
+					uint16_t pos = 0;
+					tvm.printf(0, pos++, BGFX_CONFIG_DEBUG ? 0x8c : 0x8f
+						, " %s (%s) / " BX_COMPILER_NAME " / " BX_CPU_NAME " / " BX_ARCH_NAME " / " BX_PLATFORM_NAME
+						  " / Version 1.%d.%d (commit: " BGFX_REV_SHA1 ")"
+						, getRendererName()
+						, GPU::Device::shared().name().c_str()
+						, BGFX_API_VERSION
+						, BGFX_REV_NUMBER
+						);
+
+					pos = 10;
+					tvm.printf(10, pos++, 0x8b, "        Frame: %7.3f, % 7.3f \x1f, % 7.3f \x1e [ms] / % 6.2f FPS "
+						, double(_frameTime)*toMs
+						, double(min)*toMs
+						, double(max)*toMs
+						, freq/_frameTime
+						);
+
+					tvm.printf(10, pos++, 0x8b, "    Submitted: %5d (draw %5d, compute %4d) / Binds: %4d / CPU %3.4f [ms] / GPU %3.4f [ms]"
+						, _render->m_numRenderItems
+						, _statsKeyType[0]
+						, _statsKeyType[1]
+						, _render->m_numRenderBinds
+						, double(_frameTime)*toMs
+						, GPU::Device::shared().lastFrameTimings().milliseconds
+						);
+
+					for (uint32_t ii = 0; ii < Topology::Count; ++ii)
+					{
+						tvm.printf(10, pos++, 0x8b, "   %10s: %7d"
+							, getName(Topology::Enum(ii) )
+							, _statsNumPrimsRendered[ii]
+							);
+					}
+
+					tvm.printf(10, pos++, 0x8b, "     DVB size: %7d ", _render->m_vboffset);
+					tvm.printf(10, pos++, 0x8b, "     DIB size: %7d ", _render->m_iboffset);
+
+					pos++;
+					uint8_t attr[2] = { 0x8c, 0x8a };
+					uint8_t attrIndex = _render->m_waitSubmit < _render->m_waitRender;
+
+					tvm.printf(10, pos++, attr[attrIndex    &1], " Submit wait: %3.4f [ms]", _render->m_waitSubmit*toMs);
+					tvm.printf(10, pos++, attr[(attrIndex+1)&1], " Render wait: %3.4f [ms]", _render->m_waitRender*toMs);
+
+					min = _frameTime;
+					max = _frameTime;
+				}
+
+				dbgTextSubmit(this, _blitter, tvm, _render->m_debugFrameBuffer, _render->m_debugTextScale);
+			}
+			else
+			{
+				dbgTextSubmit(this, _blitter, _render->m_textVideoMem, _render->m_debugFrameBuffer, _render->m_debugTextScale);
+			}
+		}
+
+		void dbgTextRenderBegin(TextVideoMemBlitter& /*_blitter*/, FrameBufferHandle _handle) override
+		{
+			if (isValid(_handle) )
+			{
+				traceOnce(Unsupported::DebugTextTarget, "debug text into a texture framebuffer (setDebug's framebuffer) is drawn on the window.");
+			}
+		}
+
+		/// One batch of the debug text: a transient VB/IB draw over the whole
+		/// target with a pixel ortho, the font in the blitter's R8 texture.
+		void dbgTextRender(TextVideoMemBlitter& _blitter, uint32_t _numIndices) override
+		{
+			const uint32_t numVertices = _numIndices*4/6;
+
+			BufferEacp* ib = m_indexBuffers[_blitter.m_ib->handle.idx];
+			BufferEacp* vb = m_vertexBuffers[_blitter.m_vb->handle.idx];
+			ProgramEacp* program = isValid(_blitter.m_program) ? m_program[_blitter.m_program.idx] : NULL;
+			const TextureEacp& texture = m_textures[_blitter.m_texture.idx];
+
+			if (0 == numVertices
+			||  !m_pass
+			||  NULL == ib
+			||  NULL == vb
+			||  NULL == program
+			||  !program->m_library
+			||  !texture.m_texture)
+			{
+				return;
+			}
+
+			ib->update(0, bx::strideAlign(_numIndices*2, 4), _blitter.m_ib->data);
+			vb->update(0, numVertices*_blitter.m_layout.m_stride, _blitter.m_vb->data);
+
+			const uint64_t state = 0
+				| BGFX_STATE_WRITE_RGB
+				| BGFX_STATE_WRITE_A
+				| BGFX_STATE_DEPTH_TEST_ALWAYS
+				;
+
+			const VertexLayout* layout = &_blitter.m_layout;
+			const PipelineEacp* pipeline = getPipeline(state, 0, _blitter.m_program, 1, &layout, 0);
+
+			if (!pipeline->m_pipeline->isValid() )
+			{
+				return;
+			}
+
+			// The text is laid out on bgfx's backbuffer, which covers the whole
+			// drawable (updateWindowScale).
+			GPU::RenderPass& pass = *m_pass;
+			const ::eacp::Graphics::Point size = s_frame->pixelSize();
+			const float width  = float(m_backbufferWidth);
+			const float height = float(m_backbufferHeight);
+
+			pass.setViewport({ 0.0f, 0.0f, float(size.x), float(size.y) }, 0.0f, 1.0f);
+			pass.setScissorRect({ 0.0f, 0.0f, float(size.x), float(size.y) });
+			pass.setPipeline(*pipeline->m_pipeline);
+
+			float proj[16];
+			bx::mtxOrtho(proj, 0.0f, width, height, 0.0f, 0.0f, 1000.0f, 0.0f, false);
+
+			for (uint8_t ii = 0; ii < program->m_numPredefined; ++ii)
+			{
+				const PredefinedUniform& predefined = program->m_predefined[ii];
+
+				if (PredefinedUniform::ViewProj == (predefined.m_type & ~kUniformFragmentBit) )
+				{
+					setShaderUniform(predefined.m_type, predefined.m_loc, proj, 4);
+				}
+			}
+
+			bindUniforms(pass, *program);
+
+			pass.setFragmentTexture(*texture.m_texture, 0, getSampler(uint32_t(texture.m_flags), 0, UINT8_MAX) );
+			pass.setVertexBuffer(vb->range(m_vertexStream), 0);
+			pass.drawIndexed(ib->range(m_indexStream), int(_numIndices), GPU::IndexFormat::UInt16, 0);
+
+			m_lastPipelineKey = 0;
+			m_lastPipeline    = NULL;
+		}
+
+		void dbgTextRenderEnd(TextVideoMemBlitter& /*_blitter*/) override
+		{
+		}
+
+		GPU::GPUView* m_view;
+
+		BufferEacp*  m_indexBuffers[BGFX_CONFIG_MAX_INDEX_BUFFERS];
+		BufferEacp*  m_vertexBuffers[BGFX_CONFIG_MAX_VERTEX_BUFFERS];
+		ShaderEacp*  m_shaders[BGFX_CONFIG_MAX_SHADERS];
+		ProgramEacp* m_program[BGFX_CONFIG_MAX_PROGRAMS];
+		VertexLayout m_vertexLayouts[BGFX_CONFIG_MAX_VERTEX_LAYOUTS];
+
+		std::unordered_map<uint32_t, PipelineEacp*> m_pipelines;
+		uint32_t m_lastPipelineKey = 0;
+		const PipelineEacp* m_lastPipeline = NULL;
+
+		struct PipelineQuery
+		{
+			uint64_t m_state;
+			uint64_t m_stencil;
+			uint32_t m_layoutHash[BGFX_CONFIG_MAX_VERTEX_STREAMS];
+			uint16_t m_program;
+			uint8_t  m_numStreams;
+			uint8_t  m_numInstanceData;
+		};
+
+		PipelineQuery m_lastQuery = {}; // what m_lastPipeline was looked up for
+
+		TextureEacp m_textures[BGFX_CONFIG_MAX_TEXTURES];
+		TextureEacp m_fallback[2]; // 2D, cube
+		TextureEacp m_fallbackDepth;
+		FrameBufferEacp m_frameBuffers[BGFX_CONFIG_MAX_FRAME_BUFFERS];
+		std::unordered_map<uint64_t, GPU::Sampler> m_samplers;
+		const float (*m_colorPalette)[4] = NULL;
+		uint32_t m_reset = 0;
+
+		TextVideoMem m_textVideoMem;
+
+		GPU::StreamingBuffers m_vertexStream;
+		GPU::StreamingBuffers m_indexStream;
+
+		std::optional<GPU::RenderPass> m_pass;
+		std::optional<GPU::ComputePass> m_computePass; // the open run of compute items, one view's
+		Target   m_target;
+		uint16_t m_passTexture     = kInvalidHandle; // the open pass's texture target, or the window
+		bool     m_windowDepthKept = false;          // a window pass this frame kept the depth plane
+		bool     m_needFlush       = false;          // passes recorded since the last Frame::flush
+		float    m_passScaleX       = 1.0f;           // the open pass's target pixels per bgfx unit
+		float    m_passScaleY       = 1.0f;
+		float    m_windowScaleX     = 1.0f;           // drawable pixels per backbuffer unit
+		float    m_windowScaleY     = 1.0f;
+		uint16_t m_backbufferWidth  = 1;              // the main swap chain, in the entry layer's units
+		uint16_t m_backbufferHeight = 1;
+
+		std::optional<GPU::ShaderLibrary> m_blitLibrary;
+		std::unordered_map<uint32_t, PipelineEacp*> m_blitPipelines;
+
+		struct ViewTime
+		{
+			uint16_t m_view;
+			int64_t  m_cpuBegin;
+			int64_t  m_cpuEnd;
+		};
+
+		ViewTime m_viewTimes[BGFX_CONFIG_MAX_VIEWS];
+		uint32_t m_numViewTimes = 0;
+
+		bool    m_perfTrace     = false;
+		int64_t m_perfLastBegin = 0;
+		int64_t m_perfFrame     = 0;
+		int64_t m_perfSubmit    = 0;
+		int32_t m_perfNum       = 0;
+
+		alignas(16) uint8_t m_vsScratch[64<<10];
+		alignas(16) uint8_t m_fsScratch[64<<10];
+	};
+
+	static RendererContextEacp* s_renderEacp;
+
+	RendererContextI* rendererCreate(const Init& _init)
+	{
+		s_renderEacp = BX_NEW(g_allocator, RendererContextEacp);
+		if (!s_renderEacp->init(_init) )
+		{
+			bx::deleteObject(g_allocator, s_renderEacp);
+			s_renderEacp = NULL;
+		}
+		return s_renderEacp;
+	}
+
+	void rendererDestroy()
+	{
+		bx::deleteObject(g_allocator, s_renderEacp);
+		s_renderEacp = NULL;
+	}
+
+	RenderFrame::Enum renderFrame(GPU::Frame& _frame, int32_t _msecs)
+	{
+		s_frame = &_frame;
+		const RenderFrame::Enum result = bgfx::renderFrame(_msecs);
+		s_frame = NULL;
+		return result;
+	}
+
+	bool isHiDpi()
+	{
+		return s_hiDpi;
+	}
+
+} /* namespace eacp */ } // namespace bgfx
+
+#else
+
+namespace bgfx { namespace eacp
+{
+	RendererContextI* rendererCreate(const Init& _init)
+	{
+		BX_UNUSED(_init);
+		return NULL;
+	}
+
+	void rendererDestroy()
+	{
+	}
+} /* namespace eacp */ } // namespace bgfx
+
+#endif // BGFX_CONFIG_RENDERER_EACP

@@ -917,6 +917,7 @@ namespace bgfx
 		||  RendererType::OpenGLES   == rendererType
 		||  RendererType::Metal      == rendererType
 		||  RendererType::WebGPU     == rendererType
+		||  RendererType::Eacp       == rendererType
 		   )
 		{
 			VertexLayout layout;
@@ -3360,6 +3361,7 @@ namespace bgfx
 	BGFX_RENDERER_CONTEXT(gl);
 	BGFX_RENDERER_CONTEXT(vk);
 	BGFX_RENDERER_CONTEXT(wgpu);
+	BGFX_RENDERER_CONTEXT(eacp);
 
 #undef BGFX_RENDERER_CONTEXT
 
@@ -3390,6 +3392,7 @@ namespace bgfx
 		{ gl::rendererCreate,     gl::rendererDestroy,     BGFX_RENDERER_OPENGL_NAME,     !!BGFX_CONFIG_RENDERER_OPENGL     }, // OpenGL
 		{ vk::rendererCreate,     vk::rendererDestroy,     BGFX_RENDERER_VULKAN_NAME,     !!BGFX_CONFIG_RENDERER_VULKAN     }, // Vulkan
 		{ wgpu::rendererCreate,   wgpu::rendererDestroy,   BGFX_RENDERER_WEBGPU_NAME,     !!BGFX_CONFIG_RENDERER_WEBGPU     }, // WebGPU
+		{ eacp::rendererCreate,   eacp::rendererDestroy,   BGFX_RENDERER_EACP_NAME,       !!BGFX_CONFIG_RENDERER_EACP       }, // Eacp
 	};
 	BX_PRAGMA_DIAGNOSTIC_POP();
 	static_assert(BX_COUNTOF(s_rendererCreator) == RendererType::Count);

@@ -140,6 +140,7 @@ static const char* getRendererArg(bgfx::RendererType::Enum _type)
 	case bgfx::RendererType::OpenGL:     return "--gl";
 	case bgfx::RendererType::Vulkan:     return "--vk";
 	case bgfx::RendererType::WebGPU:     return "--wgpu";
+	case bgfx::RendererType::Eacp:       return "--eacp";
 	case bgfx::RendererType::Noop:       return "--noop";
 	default: break;
 	}

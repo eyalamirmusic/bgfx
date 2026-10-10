@@ -113,6 +113,14 @@ static bgfx::ShaderHandle loadShader(bx::FileReaderI* _reader, const bx::StringV
 	case bgfx::RendererType::OpenGLES:   filePath.join("essl");  break;
 	case bgfx::RendererType::Vulkan:     filePath.join("spirv"); break;
 	case bgfx::RendererType::WebGPU:     filePath.join("wgsl");  break;
+	case bgfx::RendererType::Eacp:
+		// shaderc's eacp profile for the language eacp's backend on this OS
+		// takes, built by the eacp-bgfx workspace (CMake/EacpShaders.cmake).
+		filePath.join(BX_ENABLED(BX_PLATFORM_OSX || BX_PLATFORM_IOS || BX_PLATFORM_VISIONOS) ? "eacp-metal"
+			: BX_ENABLED(BX_PLATFORM_WINDOWS) ? "eacp-hlsl"
+			: "eacp-spirv"
+			);
+		break;
 
 	case bgfx::RendererType::Count:
 		BX_ASSERT(false, "You should not be here!");
