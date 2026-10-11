@@ -8,7 +8,7 @@
 
 #include "bgfx.h"
 
-namespace eacp { namespace GPU { class Frame; } }
+namespace eacp { namespace GPU { class Frame; class GPUView; } }
 
 namespace bgfx { namespace eacp
 {
@@ -42,6 +42,23 @@ namespace bgfx { namespace eacp
 	/// @attention Only available with `BGFX_CONFIG_RENDERER_EACP`.
 	///
 	bool isHiDpi();
+
+	/// Called at the end of each frame of a window framebuffer
+	/// (`bgfx::createFrameBuffer(nwh, ...)`, `nwh` an `eacp::GPU::GPUView`),
+	/// with the view and its frame, which is nested in the main one
+	/// (`GPUView::renderFrame`), with no pass open, before it presents.
+	///
+	/// @attention Only available with `BGFX_CONFIG_RENDERER_EACP`.
+	///
+	typedef void (*WindowFrameFn)(::eacp::GPU::GPUView& _view, ::eacp::GPU::Frame& _frame, void* _userData);
+
+	/// Sets (or, with `NULL`, clears) the window frame callback. Call it on
+	/// eacp's main thread. An entry layer's off-screen capture mode reads a
+	/// window's picture back through it (`Frame::copyDrawable`).
+	///
+	/// @attention Only available with `BGFX_CONFIG_RENDERER_EACP`.
+	///
+	void setWindowFrameCallback(WindowFrameFn _fn, void* _userData);
 
 } /* namespace eacp */ } // namespace bgfx
 

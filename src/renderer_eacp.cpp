@@ -31,6 +31,8 @@ namespace bgfx { namespace eacp
 {
 	static GPU::Frame* s_frame;
 	static std::atomic<bool> s_hiDpi;
+	static WindowFrameFn s_windowFrameCallback = NULL;
+	static void* s_windowFrameUserData = NULL;
 
 	GPU::Frame* currentFrame()
 	{
@@ -44,6 +46,8 @@ namespace bgfx { namespace eacp
 		{
 			SamplerKind,
 			SwapChain,          // G16
+			SwapChainFrame,     // G16
+			SwapChainOrder,     // G16
 			FrameBufferColor,   // attachments eacp's pass refuses together
 			FrameBufferLayer,   // layered rendering
 			FrameBufferFormat,
@@ -1912,6 +1916,37 @@ namespace bgfx { namespace eacp
 		uint64_t m_listed[(BGFX_CONFIG_MAX_OCCLUSION_QUERIES+63)/64] = {};
 	};
 
+	/// What the window passes of one frame render into and how bgfx's units
+	/// map onto it (updateWindowScale): the main swap chain's while the
+	/// main frame's views run, a window framebuffer's while its views run
+	/// in that window's own frame (submitSwapChain swaps them).
+	struct WindowState
+	{
+		GPU::GPUView* m_view = NULL;
+		GPU::Frame*   m_frame = NULL;
+		std::optional<GPU::Texture> m_proxy;
+		std::optional<GPU::RenderPipeline>* m_upscalePipeline = NULL;
+		bool     m_proxied   = false;
+		bool     m_depthKept = false;
+		bool     m_needFlush = false;
+		bool     m_hiDpi     = false;
+		uint32_t m_msaa      = 0;
+		float    m_scaleX    = 1.0f;
+		float    m_scaleY    = 1.0f;
+		uint16_t m_width     = 1;
+		uint16_t m_height    = 1;
+	};
+
+	/// A framebuffer on another window (createFrameBuffer(nwh), G16): nwh
+	/// is that window's GPUView. Its views render in a frame of that view
+	/// nested in the main one (GPUView::renderFrame), one per bgfx frame,
+	/// through the same window passes as the main window's.
+	struct SwapChainEacp
+	{
+		SwapChain   m_desc;
+		WindowState m_window;
+	};
+
 	struct RendererContextEacp : public RendererContextI
 	{
 		RendererContextEacp()
@@ -2031,6 +2066,9 @@ namespace bgfx { namespace eacp
 				| (device.supportsLayeredRendering() ? BGFX_CAPS_VIEWPORT_LAYER_ARRAY : 0)
 				// Uint10 attributes read as 10-10-10-2 normalised (G7).
 				| BGFX_CAPS_VERTEX_ATTRIB_UINT10
+				// A window framebuffer is its own GPUView's frame, nested in
+				// the main one (G16, submitSwapChain).
+				| BGFX_CAPS_SWAP_CHAIN
 				;
 
 			// bgfx has no caps bit for occlusion queries (every renderer has
@@ -2725,15 +2763,113 @@ namespace bgfx { namespace eacp
 			return uint32_t(_sub.m_slice) + _sub.m_layers <= extent;
 		}
 
-		void createFrameBuffer(FrameBufferHandle _handle, const SwapChain& /*_desc*/) override
+		/// A window framebuffer: nwh is the window's GPUView, which renders
+		/// at its own planes (the entry layer's: depth and stencil), at the
+		/// swap chain's size in bgfx's units and its MSAA, as the main
+		/// window does. Recreated whole on a resize (resizeFrameBuffer),
+		/// which drops the old window target.
+		void createFrameBuffer(FrameBufferHandle _handle, const SwapChain& _desc) override
 		{
-			traceOnce(Unsupported::SwapChain, "G16: a framebuffer on a second window is not created; its views are skipped.");
 			m_frameBuffers[_handle.idx] = FrameBufferEacp();
+			m_swapChains[_handle.idx].reset();
+
+			if (NULL == _desc.nwh)
+			{
+				traceOnce(Unsupported::SwapChain, "G16: a window framebuffer without nwh is not created; its views are skipped.");
+				return;
+			}
+
+			if (isValid(_desc.depth) )
+			{
+				traceOnce(Unsupported::SwapChain, "G16: a window framebuffer's own depth texture is ignored; the window's view has its planes.");
+			}
+
+			BX_TRACE("eacp: window framebuffer %d, %ux%u, nwh %p.", _handle.idx, _desc.width, _desc.height, _desc.nwh);
+
+			SwapChainEacp& swapChain = m_swapChains[_handle.idx].emplace();
+			swapChain.m_desc           = _desc;
+			swapChain.m_window.m_view  = static_cast<GPU::GPUView*>(_desc.nwh);
+			swapChain.m_window.m_msaa  = (_desc.flags & BGFX_SWAP_CHAIN_MSAA_MASK) >> BGFX_SWAP_CHAIN_MSAA_SHIFT;
+			swapChain.m_window.m_hiDpi = 0 != (_desc.flags & BGFX_SWAP_CHAIN_HIDPI);
 		}
 
 		void destroyFrameBuffer(FrameBufferHandle _handle) override
 		{
 			m_frameBuffers[_handle.idx] = FrameBufferEacp();
+			m_swapChains[_handle.idx].reset();
+		}
+
+		/// Puts _window's state in place of the window members (and takes
+		/// theirs into it): from then on the window passes, the window
+		/// target, the upscale and s_frame are that window's.
+		void swapWindow(WindowState& _window)
+		{
+			std::swap(m_view, _window.m_view);
+			m_windowProxy.swap(_window.m_proxy);
+			std::swap(m_upscalePipeline, _window.m_upscalePipeline);
+			std::swap(m_windowProxied,   _window.m_proxied);
+			std::swap(m_windowDepthKept, _window.m_depthKept);
+			std::swap(m_needFlush,       _window.m_needFlush);
+			std::swap(m_windowMsaa,      _window.m_msaa);
+			std::swap(m_windowScaleX,    _window.m_scaleX);
+			std::swap(m_windowScaleY,    _window.m_scaleY);
+			std::swap(m_backbufferWidth, _window.m_width);
+			std::swap(m_backbufferHeight, _window.m_height);
+			std::swap(s_frame,           _window.m_frame);
+
+			const bool hiDpi = s_hiDpi;
+			s_hiDpi = _window.m_hiDpi;
+			_window.m_hiDpi = hiDpi;
+		}
+
+		/// The views on window framebuffer _fbh, in a frame of that window
+		/// nested in _frame (GPUView::renderFrame), which takes its next
+		/// drawable and presents it as it returns. Nothing may be open on
+		/// _frame: its pass ends, and a framebuffer's mips due are built
+		/// first, so the window's views see what the main frame drew
+		/// before them. The window passes are the main window's, at this
+		/// window's size, scale and MSAA (updateWindowScale), its depth
+		/// kept across its views; then the window target is drawn onto its
+		/// drawable (presentWindowProxy) and the entry layer's hook, if
+		/// any, sees the frame before it presents.
+		void submitSwapChain(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, uint16_t _fbh, uint32_t* _statsNumPrimsRendered)
+		{
+			SwapChainEacp& swapChain = *m_swapChains[_fbh];
+
+			endPass();
+			resolveFrameBuffer(_frame);
+
+			swapWindow(swapChain.m_window);
+
+			const bool drawn = m_view->renderFrame([&](GPU::Frame& _windowFrame)
+				{
+					s_frame     = &_windowFrame;
+					m_needFlush = false;
+
+					updateWindowScale(_windowFrame, swapChain.m_desc);
+
+					uint32_t statsKeyType[2] = {};
+					submitItems(_windowFrame, _render, _clearQuad, statsKeyType, _statsNumPrimsRendered, _fbh);
+
+					presentWindowProxy(_windowFrame);
+					endPass();
+
+					if (NULL != s_windowFrameCallback)
+					{
+						s_windowFrameCallback(*m_view, _windowFrame, s_windowFrameUserData);
+					}
+				});
+
+			swapWindow(swapChain.m_window);
+
+			swapChain.m_window.m_frame = NULL;
+			m_lastPipelineKey = 0;
+			m_lastPipeline    = NULL;
+
+			if (!drawn)
+			{
+				traceOnce(Unsupported::SwapChainFrame, "G16: a window framebuffer's view gave no drawable (no size yet, or its own frame open); its views are skipped this frame.");
+			}
 		}
 
 		/// The framebuffer's target texture (the one carrying the depth plane),
@@ -5275,9 +5411,18 @@ namespace bgfx { namespace eacp
 			return NULL;
 		}
 
-		void submitItems(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, uint32_t* _statsKeyType, uint32_t* _statsNumPrimsRendered)
+		/// The frame's items in sort order into _frame. With _swapChain, only
+		/// the views on that window framebuffer, inside its window's frame
+		/// (submitSwapChain); without it every other view, each window's
+		/// views drawn in its own frame where the first of them comes in the
+		/// order (G16), the blits all here.
+		void submitItems(GPU::Frame& _frame, Frame* _render, const ClearQuad& _clearQuad, uint32_t* _statsKeyType, uint32_t* _statsNumPrimsRendered, uint16_t _swapChain = kInvalidHandle)
 		{
-			static ViewState viewState;
+			const bool nested = kInvalidHandle != _swapChain;
+
+			static ViewState s_viewState;
+			static ViewState s_windowViewState;
+			ViewState& viewState = nested ? s_windowViewState : s_viewState;
 			viewState.reset(_render);
 
 			m_windowDepthKept = false;
@@ -5285,7 +5430,17 @@ namespace bgfx { namespace eacp
 			m_passDepth       = kInvalidHandle;
 			m_genFrameBuffer  = kInvalidHandle;
 			m_passNumColor    = 0;
-			m_numViewTimes    = 0;
+
+			if (!nested)
+			{
+				m_numViewTimes = 0;
+				bx::memSet(m_swapChainDrawn, 0, sizeof(m_swapChainDrawn) );
+			}
+
+			// The window framebuffer the views just before were on, and
+			// whether this view is one the call leaves to another frame.
+			uint16_t lastSwapChain = kInvalidHandle;
+			bool viewElsewhere = false;
 
 			if (!m_fallbackDepth.m_depthKept
 			&&  m_fallbackDepth.isTarget() )
@@ -5303,6 +5458,12 @@ namespace bgfx { namespace eacp
 
 			UniformCacheState ucs(_render);
 			BlitState bs(_render);
+
+			if (nested)
+			{
+				// The blits are the main frame's.
+				bs.m_item = _render->m_numBlitItems;
+			}
 
 			bool viewSkipped = true;
 			bool viewBegun   = false; // the view's first draw has opened (or joined) its pass
@@ -5345,6 +5506,37 @@ namespace bgfx { namespace eacp
 						submitBlit(_frame, bs.advance() );
 					}
 
+					// The window framebuffer the view is on, if any (G16).
+					const uint16_t swapChain = isValid(renderView->m_fbh) && m_swapChains[renderView->m_fbh.idx]
+						? renderView->m_fbh.idx
+						: kInvalidHandle
+						;
+
+					viewElsewhere = swapChain != _swapChain;
+
+					if (!nested
+					&&  kInvalidHandle != swapChain)
+					{
+						if (!m_swapChainDrawn[swapChain])
+						{
+							// The window's views, all of them, in its frame,
+							// here where the first comes.
+							m_swapChainDrawn[swapChain] = true;
+							submitSwapChain(_frame, _render, _clearQuad, swapChain, _statsNumPrimsRendered);
+						}
+						else if (swapChain != lastSwapChain)
+						{
+							traceOnce(Unsupported::SwapChainOrder, "G16: a window's views apart in the view order are drawn together at its first; views between them that draw what they read are seen early.");
+						}
+					}
+
+					lastSwapChain = swapChain;
+
+					if (viewElsewhere)
+					{
+						continue;
+					}
+
 					noteViewTime(view);
 
 					// A view's compute items get a pass, and a timing label, of
@@ -5356,12 +5548,18 @@ namespace bgfx { namespace eacp
 					viewSkipped     = false;
 					viewBegun       = false;
 
-					if (isValid(renderView->m_fbh) )
+					if (isValid(renderView->m_fbh)
+					&&  !nested)
 					{
 						viewTarget      = frameBufferTarget(renderView->m_fbh.idx);
 						viewFrameBuffer = &m_frameBuffers[renderView->m_fbh.idx];
 						viewSkipped     = NULL == viewTarget;
 					}
+				}
+
+				if (viewElsewhere)
+				{
+					continue;
 				}
 
 				if (isCompute)
@@ -5721,6 +5919,11 @@ namespace bgfx { namespace eacp
 			}
 
 			resolveFrameBuffer(_frame);
+
+			if (nested)
+			{
+				return;
+			}
 
 			while (bs.hasItem(BGFX_CONFIG_MAX_VIEWS) )
 			{
@@ -6270,6 +6473,8 @@ namespace bgfx { namespace eacp
 		TextureEacp m_fallback[5]; // by GPU::TextureType: 2D, cube, 2D array, cube array, 3D
 		TextureEacp m_fallbackDepth;
 		FrameBufferEacp m_frameBuffers[BGFX_CONFIG_MAX_FRAME_BUFFERS];
+		std::optional<SwapChainEacp> m_swapChains[BGFX_CONFIG_MAX_FRAME_BUFFERS]; // the window framebuffers (G16)
+		bool m_swapChainDrawn[BGFX_CONFIG_MAX_FRAME_BUFFERS]; // ... whose views this frame has drawn
 		std::unordered_map<uint64_t, GPU::Sampler> m_samplers;
 		const float (*m_colorPalette)[4] = NULL;
 		uint32_t m_reset = 0;
@@ -6372,6 +6577,12 @@ namespace bgfx { namespace eacp
 	bool isHiDpi()
 	{
 		return s_hiDpi;
+	}
+
+	void setWindowFrameCallback(WindowFrameFn _fn, void* _userData)
+	{
+		s_windowFrameCallback = _fn;
+		s_windowFrameUserData = _userData;
 	}
 
 } /* namespace eacp */ } // namespace bgfx
