@@ -49,7 +49,7 @@ namespace bgfx { namespace eacp
 			FrameBufferFormat,  // G4
 			FrameBufferDepth,
 			DepthUnbound,
-			ScreenShotWindow,   // G34
+			ScreenShotWindow,   // no frame, or an unreadable drawable
 			DebugTextTarget,
 			RenderImage,        // G40
 			VertexTexture,      // G17
@@ -71,7 +71,6 @@ namespace bgfx { namespace eacp
 			BlitVolume,
 			Indirect,
 			Msaa,               // window is sample count 1
-			Capture,            // G34
 			OcclusionQuery,     // G10
 			BlendFactor,        // G26
 			DepthBias,          // G27
@@ -1864,6 +1863,7 @@ namespace bgfx { namespace eacp
 
 		~RendererContextEacp()
 		{
+			captureFinish();
 			m_computePass.reset();
 			m_pass.reset();
 
@@ -1916,6 +1916,16 @@ namespace bgfx { namespace eacp
 			}
 
 			m_view = static_cast<GPU::GPUView*>(_init.swapChain.nwh);
+
+			// A window screenshot or BGFX_RESET_CAPTURE on a drawable rendered
+			// directly (BGFX_RESET_HIDPI) copies the drawable out
+			// (copyWindow), which a view allows only when asked: on Metal it
+			// is the layer's framebufferOnly turned off.
+			if (NULL != m_view)
+			{
+				m_view->setReadableDrawable(true);
+			}
+
 			s_hiDpi = 0 != (_init.swapChain.flags & BGFX_SWAP_CHAIN_HIDPI);
 
 			g_caps.vendorId = BGFX_PCI_ID_NONE;
@@ -2703,16 +2713,251 @@ namespace bgfx { namespace eacp
 			}
 		}
 
-		/// A screenshot of a texture framebuffer through Texture::read. The
-		/// window's is G34: the drawable is not readable from inside the frame
-		/// (eacp's Frame hands out neither it nor a read of it, and
-		/// View::renderToImage would render the frame again, re-entering
-		/// bgfx::renderFrame).
+		/// One texture of BGFX_RESET_CAPTURE's ring (captureWindow).
+		struct CaptureSlot
+		{
+			std::optional<GPU::Texture> m_texture;
+			bool m_pending = false; // copied, not yet handed to captureFrame
+		};
+
+		static constexpr uint32_t kNumCaptures = GPU::StreamingBuffers::framesInFlight;
+
+		/// The window's picture as bgfx's backbuffer holds it: with the window
+		/// target (updateWindowScale) that is m_windowProxy, at the
+		/// backbuffer's size, which is what stock Metal's drawable holds (a
+		/// layer at the window's point size); a drawable rendered directly
+		/// (BGFX_RESET_HIDPI, or a backbuffer at the drawable's size) is the
+		/// drawable itself, through Frame::copyDrawable. Its size, its eacp
+		/// format and bgfx's name for that format; false when there is none
+		/// bgfx can name.
+		bool windowPicture(const GPU::Frame& _frame, uint32_t& _width, uint32_t& _height, GPU::TextureFormat& _format, TextureFormat::Enum& _bgfxFormat) const
+		{
+			if (m_windowProxied)
+			{
+				_width      = m_windowProxy->width();
+				_height     = m_windowProxy->height();
+				_format     = m_windowProxy->format();
+				_bgfxFormat = TextureFormat::BGRA8;
+				return true;
+			}
+
+			const ::eacp::Graphics::Point size = _frame.pixelSize();
+			_width  = uint32_t(size.x);
+			_height = uint32_t(size.y);
+			_format = _frame.drawableFormat();
+
+			switch (_format)
+			{
+			case GPU::TextureFormat::BGRA8Unorm: _bgfxFormat = TextureFormat::BGRA8; break;
+			case GPU::TextureFormat::RGBA8Unorm: _bgfxFormat = TextureFormat::RGBA8; break;
+			default: return false;
+			}
+
+			return 0 < _width && 0 < _height;
+		}
+
+		/// Records a copy of the window's picture (windowPicture) into _dest,
+		/// in order with the passes, (re)making _dest at the picture's size and
+		/// format; its bgfx format in _bgfxFormat. Read after flushFrame, or
+		/// once the frame has ended.
+		bool copyWindow(GPU::Frame& _frame, std::optional<GPU::Texture>& _dest, TextureFormat::Enum& _bgfxFormat)
+		{
+			uint32_t width  = 0;
+			uint32_t height = 0;
+			GPU::TextureFormat format = GPU::TextureFormat::BGRA8Unorm;
+
+			if (!windowPicture(_frame, width, height, format, _bgfxFormat) )
+			{
+				return false;
+			}
+
+			if (!_dest
+			||  _dest->width()  != int(width)
+			||  _dest->height() != int(height)
+			||  _dest->format() != format)
+			{
+				GPU::TextureDescriptor desc;
+				desc.width  = int(width);
+				desc.height = int(height);
+				desc.format = format;
+				_dest.emplace(GPU::Device::shared().makeTexture(desc, NULL) );
+
+				if (!_dest->isValid() )
+				{
+					_dest.reset();
+					return false;
+				}
+			}
+
+			endPass();
+			m_needFlush = true;
+
+			if (m_windowProxied)
+			{
+				_frame.copy(*m_windowProxy, *_dest);
+				return true;
+			}
+
+			return _frame.copyDrawable(*_dest);
+		}
+
+		/// The window's screenshot: its picture copied out after the frame's
+		/// last pass (bgfx asks after submit, so the debug text is in it, as
+		/// on stock), the frame flushed and the copy read, BGRA8 (RGBA8 on a
+		/// drawable that is), top row first, at the backbuffer's size.
+		void screenShotWindow(const char* _filePath)
+		{
+			TextureFormat::Enum format = TextureFormat::BGRA8;
+
+			if (NULL == s_frame
+			||  !copyWindow(*s_frame, m_screenShot, format) )
+			{
+				traceOnce(Unsupported::ScreenShotWindow, "A screenshot of the window is not taken: no frame is open, or its picture cannot be copied (a drawable not made readable, or of a format bgfx cannot name).");
+				return;
+			}
+
+			flushFrame();
+
+			const uint32_t width  = uint32_t(m_screenShot->width() );
+			const uint32_t height = uint32_t(m_screenShot->height() );
+			const uint32_t pitch  = width*4;
+			const uint32_t size   = height*pitch;
+			uint8_t* data = (uint8_t*)bx::alloc(g_allocator, size);
+
+			m_screenShot->read(data, int(pitch) );
+
+			g_callback->screenShot(
+				  _filePath
+				, width
+				, height
+				, pitch
+				, format
+				, data
+				, size
+				, false
+				);
+
+			bx::free(g_allocator, data);
+		}
+
+		/// BGFX_RESET_CAPTURE, as renderer_mtl.cpp's updateCapture: begins
+		/// when the flag is set and a frame is there to size the picture
+		/// from, begins again (after an end) when the picture's size changes,
+		/// ends when the flag is cleared. captureBegin's size, pitch and
+		/// format are the picture's (windowPicture), not flipped.
+		void updateCapture(GPU::Frame* _frame)
+		{
+			if (0 == (m_reset & BGFX_RESET_CAPTURE) )
+			{
+				captureFinish();
+				return;
+			}
+
+			uint32_t width  = 0;
+			uint32_t height = 0;
+			GPU::TextureFormat format = GPU::TextureFormat::BGRA8Unorm;
+			TextureFormat::Enum bgfxFormat = TextureFormat::BGRA8;
+
+			if (NULL == _frame
+			||  !windowPicture(*_frame, width, height, format, bgfxFormat) )
+			{
+				return;
+			}
+
+			if (m_capturing
+			&&  (width      != m_captureWidth
+			||   height     != m_captureHeight
+			||   bgfxFormat != m_captureFormat) )
+			{
+				captureFinish();
+			}
+
+			if (!m_capturing)
+			{
+				m_capturing     = true;
+				m_captureWidth  = width;
+				m_captureHeight = height;
+				m_captureFormat = bgfxFormat;
+				m_captureSize   = width*height*4;
+				m_capture       = bx::realloc(g_allocator, m_capture, m_captureSize);
+				g_callback->captureBegin(width, height, width*4, bgfxFormat, false);
+			}
+		}
+
+		/// One frame of BGFX_RESET_CAPTURE: the window's picture after the
+		/// last view and before the debug text, where every stock backend
+		/// takes it, copied into a ring of kNumCaptures textures and read
+		/// kNumCaptures frames later, when the GPU has long finished it,
+		/// rather than flushing and waiting for this frame as stock does.
+		/// The slot about to be reused is read and handed to captureFrame
+		/// first, so the frames reach the callback in order.
+		void captureWindow(GPU::Frame& _frame)
+		{
+			if (!m_capturing)
+			{
+				return;
+			}
+
+			CaptureSlot& slot = m_captureSlots[m_captureNext % kNumCaptures];
+			readCapture(slot);
+
+			TextureFormat::Enum format = TextureFormat::BGRA8;
+
+			if (copyWindow(_frame, slot.m_texture, format)
+			&&  uint32_t(slot.m_texture->width() )  == m_captureWidth
+			&&  uint32_t(slot.m_texture->height() ) == m_captureHeight)
+			{
+				slot.m_pending = true;
+				++m_captureNext;
+			}
+		}
+
+		/// Hands a recorded capture to captureFrame. Its frame has ended, or
+		/// been flushed (captureFinish), before this is called.
+		void readCapture(CaptureSlot& _slot)
+		{
+			if (!_slot.m_pending)
+			{
+				return;
+			}
+
+			_slot.m_pending = false;
+			_slot.m_texture->read(m_capture, int(m_captureWidth*4) );
+			g_callback->captureFrame(m_capture, m_captureSize);
+		}
+
+		/// Reads the captures still in the ring, oldest first, and ends the
+		/// capture.
+		void captureFinish()
+		{
+			if (!m_capturing)
+			{
+				return;
+			}
+
+			flushFrame();
+
+			for (uint32_t ii = 0; ii < kNumCaptures; ++ii)
+			{
+				readCapture(m_captureSlots[(m_captureNext + ii) % kNumCaptures]);
+			}
+
+			g_callback->captureEnd();
+			bx::free(g_allocator, m_capture);
+			m_capture     = NULL;
+			m_captureSize = 0;
+			m_capturing   = false;
+		}
+
+		/// The main window's screenshot through screenShotWindow. bgfx hands
+		/// over no other handle than a window framebuffer's (bgfx_p.h's
+		/// requestScreenShot refuses a texture framebuffer's); one with a
+		/// target is read through Texture::read.
 		void requestScreenShot(FrameBufferHandle _handle, const char* _filePath) override
 		{
 			if (!isValid(_handle) )
 			{
-				traceOnce(Unsupported::ScreenShotWindow, "G34: a screenshot of the window is not taken (no read of the drawable inside a frame).");
+				screenShotWindow(_filePath);
 				return;
 			}
 
@@ -4286,11 +4531,6 @@ namespace bgfx { namespace eacp
 
 			m_windowMsaa = (_render->m_mainSwapChain.flags & BGFX_SWAP_CHAIN_MSAA_MASK) >> BGFX_SWAP_CHAIN_MSAA_SHIFT;
 
-			if (0 != (m_reset & BGFX_RESET_CAPTURE) )
-			{
-				traceOnce(Unsupported::Capture, "G34: BGFX_RESET_CAPTURE calls no captureBegin or captureFrame (no read of the drawable inside a frame).");
-			}
-
 			if (0 != (_render->m_debug & BGFX_DEBUG_WIREFRAME) )
 			{
 				traceOnce(Unsupported::Wireframe, "G28: BGFX_DEBUG_WIREFRAME has no eacp fill mode.");
@@ -4303,12 +4543,19 @@ namespace bgfx { namespace eacp
 				updateWindowScale(*s_frame, _render->m_mainSwapChain);
 			}
 
+			updateCapture(s_frame);
+
 			resolveOcclusion(_render);
 
 			if (NULL != s_frame
 			&&  0 == (_render->m_debug & BGFX_DEBUG_IFH) )
 			{
 				submitItems(*s_frame, _render, _clearQuad, statsKeyType, statsNumPrimsRendered);
+
+				if (0 < _render->m_numRenderItems)
+				{
+					captureWindow(*s_frame);
+				}
 			}
 
 			const int64_t timeEnd   = bx::getHPCounter();
@@ -5973,6 +6220,15 @@ namespace bgfx { namespace eacp
 		bool     m_needFlush       = false;          // passes recorded since the last Frame::flush
 		float    m_passScaleX       = 1.0f;           // the open pass's target pixels per bgfx unit
 		float    m_passScaleY       = 1.0f;
+		std::optional<GPU::Texture> m_screenShot;             // the window's screenshot (screenShotWindow)
+		CaptureSlot         m_captureSlots[kNumCaptures];     // BGFX_RESET_CAPTURE's ring (captureWindow)
+		uint32_t            m_captureNext   = 0;              // the slot the next capture goes into, mod kNumCaptures
+		bool                m_capturing     = false;          // captureBegin called, captureEnd not yet
+		uint32_t            m_captureWidth  = 0;
+		uint32_t            m_captureHeight = 0;
+		TextureFormat::Enum m_captureFormat = TextureFormat::BGRA8;
+		void*               m_capture       = NULL;           // one frame's pixels, for captureFrame
+		uint32_t            m_captureSize   = 0;
 		std::optional<GPU::Texture>        m_windowProxy;     // the window's passes' target without BGFX_RESET_HIDPI on a scaled drawable (updateWindowScale)
 		std::optional<GPU::Buffer>         m_zeroSource;      // what attributes no stream carries read in a draw without streams (bindFallbackSource)
 		std::vector<GPU::Buffer>           m_zeroSourceRetired;
